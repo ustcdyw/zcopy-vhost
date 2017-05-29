@@ -1,0 +1,3895 @@
+diff --git a/.gitignore b/.gitignore
+index b8bb41f..91a261b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,6 @@
+ /build
+ *cscope*
++*.o
++*.map
++*.o.cmd
++*build*
+diff --git a/drivers/net/virtio/virtio_rxtx.c b/drivers/net/virtio/virtio_rxtx.c
+index c5b53bb..81e1c20 100644
+--- a/drivers/net/virtio/virtio_rxtx.c
++++ b/drivers/net/virtio/virtio_rxtx.c
+@@ -36,6 +36,11 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <errno.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/ioctl.h>
++#include <fcntl.h>
++#include <sys/mman.h>
+ 
+ #include <rte_cycles.h>
+ #include <rte_memory.h>
+@@ -133,6 +138,102 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq, struct rte_mbuf **rx_pkts,
+ #define DEFAULT_TX_FREE_THRESH 32
+ #endif
+ 
++static void __rte_unused
++//virtio_tlb_flush(void *flush_table, uint16_t num)
++virtio_tlb_flush(void)
++{
++	static int tlb_fd = -1;
++	// unsigned long arg[2];
++	if (tlb_fd == -1) {
++		tlb_fd = open("/dev/tlb_ctl", 0);
++		if (tlb_fd == -1) {
++			perror("open tlb_ctl");
++			exit(1);
++		}
++	}
++	// arg[0] = (unsigned long)flush_table;
++	// arg[1] = (unsigned long)num;
++	ioctl(tlb_fd, 0, 0);
++}
++
++static void __rte_unused
++dump_mempool_addr(uint64_t addr)
++{
++	int i, j;
++	for (i = 0; i < 4096; i += 32) {
++		printf("%04x:", i);
++		for (j = 0; j < 32; j++) {
++			if (j % 8 == 0)
++				printf(" ");
++			printf("%02x ", (((unsigned char *)addr)[i+j]));
++		}
++		printf("\n");
++	}
++}
++#if 0
++/* Cleanup from completed transmits. */
++static void
++virtio_xmit_cleanup(struct virtqueue *vq, uint16_t num)
++{
++	uint16_t i, used_idx, desc_idx;
++	void **cookie_p[num];
++	static unsigned long *tlb_flush = NULL;
++	static int tlb_fd = -1;
++	if (tlb_fd == -1) {
++		tlb_fd = open("/dev/tlb_ctl", O_RDWR);
++		if (tlb_fd < 0) {
++			perror("open tlb_ctl");
++			exit(1);
++		}
++		tlb_flush = (unsigned long *)mmap(0, 4096,
++				PROT_READ|PROT_WRITE, MAP_SHARED, tlb_fd, 0);
++		if (tlb_flush == MAP_FAILED) {
++			perror("mmap tlb_ctl");
++			munmap(tlb_flush, 4096);
++			exit(1);
++		}
++	}
++	//printf("%d ", (int)num);
++	for (i = 0; i < num; i++) {
++		struct vring_used_elem *uep;
++		struct vq_desc_extra *dxp;
++
++		used_idx = (uint16_t)(vq->vq_used_cons_idx & (vq->vq_nentries - 1));
++		uep = &vq->vq_ring.used->ring[used_idx];
++
++		desc_idx = (uint16_t) uep->id;
++		dxp = &vq->vq_descx[desc_idx];
++		vq->vq_used_cons_idx++;
++		vq_ring_free_chain(vq, desc_idx);
++
++		if (dxp->cookie != NULL) {
++			tlb_flush[i] = (unsigned long)dxp->cookie;
++			cookie_p[i] = &dxp->cookie;
++		}
++	}
++	ioctl(tlb_fd, 0, num);
++	/*
++	for (i = 0; i< num; i++) {
++		printf("before flush %d addr %p\n", (int)i, tlb_flush[i]);
++		dump_mempool_addr((((uint64_t)tlb_flush[i]) >> 12 ) << 12);
++		printf("\n\n");
++	} */
++	/*
++	printf("--------------tlb flush----------------\n");
++	getchar();
++	for (i = 0; i< num; i++) {
++		printf("after flush %d addr %p\n", (int)i, tlb_flush[i]);
++		dump_mempool_addr((((uint64_t)tlb_flush[i]) >> 12 ) << 12);
++		printf("\n\n");
++	}*/
++	for (i = 0; i < num; i++) {
++		if (tlb_flush[i] != 0) {
++			rte_pktmbuf_free((void *)tlb_flush[i]);
++			*((void **)(cookie_p[i])) = NULL;
++		}
++	}
++}
++#endif
+ /* Cleanup from completed transmits. */
+ static void
+ virtio_xmit_cleanup(struct virtqueue *vq, uint16_t num)
+@@ -158,6 +259,7 @@ virtio_xmit_cleanup(struct virtqueue *vq, uint16_t num)
+ }
+ 
+ 
++
+ static inline int
+ virtqueue_enqueue_recv_refill(struct virtqueue *vq, struct rte_mbuf *cookie)
+ {
+@@ -215,6 +317,7 @@ virtqueue_enqueue_xmit(struct virtqueue *txvq, struct rte_mbuf *cookie)
+ 	head_idx = txvq->vq_desc_head_idx;
+ 	if (unlikely(head_idx >= txvq->vq_nentries))
+ 		return -EFAULT;
++	//rte_prefetch0(&txvq->vq_ring.desc[head_idx]);
+ 
+ 	idx = head_idx;
+ 	dxp = &txvq->vq_descx[idx];
+@@ -222,6 +325,7 @@ virtqueue_enqueue_xmit(struct virtqueue *txvq, struct rte_mbuf *cookie)
+ 	dxp->ndescs = needed;
+ 
+ 	start_dp = txvq->vq_ring.desc;
++	//rte_prefetch0(&start_dp[start_dp[idx].next]);
+ 	start_dp[idx].addr =
+ 		txvq->virtio_net_hdr_mem + idx * head_size;
+ 	start_dp[idx].len = (uint32_t)head_size;
+@@ -508,6 +612,7 @@ virtio_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts)
+ 
+ 	if (num == 0)
+ 		return 0;
++	virtio_tlb_flush();
+ 
+ 	num = virtqueue_dequeue_burst_rx(rxvq, rcv_pkts, len, num);
+ 	PMD_RX_LOG(DEBUG, "used:%d dequeue:%d", nb_used, num);
+@@ -740,6 +845,19 @@ virtio_recv_mergeable_pkts(void *rx_queue,
+ 
+ 	return nb_rx;
+ }
++static inline uint64_t read_tsc(void)
++{
++	uint64_t time;
++	uint32_t msw, lsw;
++	__asm__ __volatile__("rdtsc\n\t"
++			     "movl %%edx, %0\n\t"
++			     "movl %%eax, %1\n\t"
++			     : "=r" (msw), "=r"(lsw)
++			     :
++			     : "%edx", "%eax");
++	time = ((uint64_t) msw << 32) | lsw;
++	return time;
++}
+ 
+ uint16_t
+ virtio_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
+@@ -748,6 +866,13 @@ virtio_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
+ 	struct rte_mbuf *txm;
+ 	uint16_t nb_used, nb_tx;
+ 	int error;
++	static int once = 0;
++	/*
++	static unsigned long *tlb_flush = NULL;
++	int i;
++	*/
++	if (once < 140)
++		printf("%04d: ", once++);
+ 
+ 	if (unlikely(nb_pkts < 1))
+ 		return nb_pkts;
+@@ -756,10 +881,51 @@ virtio_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
+ 	nb_used = VIRTQUEUE_NUSED(txvq);
+ 
+ 	virtio_rmb();
+-	if (likely(nb_used > txvq->vq_nentries - txvq->vq_free_thresh))
++	if (likely(nb_used > txvq->vq_nentries - txvq->vq_free_thresh)) {
+ 		virtio_xmit_cleanup(txvq, nb_used);
++	}
+ 
+ 	nb_tx = 0;
++	unsigned long long time[3];
++
++#if 0
++	if (tlb_fd == -1) {
++		tlb_fd = open("/dev/tlb_ctl", O_RDWR);
++		if (tlb_fd < 0) {
++			perror("open tlb_ctl");
++			exit(1);
++		}
++		tlb_flush = (unsigned long *)mmap(0, 4096,
++				PROT_READ|PROT_WRITE, MAP_SHARED, tlb_fd, 0);
++		if (tlb_flush == MAP_FAILED) {
++			perror("mmap tlb_ctl");
++			munmap(tlb_flush, 4096);
++			exit(1);
++		}
++	}
++
++	uint16_t used_idx = (uint16_t)(txvq->vq_used_cons_idx & (txvq->vq_nentries - 1));
++	for (i = 0; i < nb_pkts; i++) {
++		struct vring_used_elem *uep;
++		struct vq_desc_extra *dxp;
++
++		uep = &txvq->vq_ring.used->ring[used_idx];
++		dxp = &txvq->vq_descx[(uint16_t)uep->id];
++		if (dxp->cookie != NULL)
++			tlb_flush[i] = (unsigned long)dxp->cookie;
++		used_idx = (uint16_t)((used_idx+1) & (txvq->vq_nentries - 1));
++	}
++#endif
++	//time[0] = read_tsc();
++	virtio_tlb_flush();
++	//time[1] = read_tsc();
++	/*
++	for (i = 0; i < nb_pkts; i++) {
++		rte_prefetch0((void *)tx_pkts[i]);
++	}
++	*/
++	rte_prefetch0((void *)txvq);
++	rte_prefetch0((void *)tx_pkts[0]);
+ 
+ 	while (nb_tx < nb_pkts) {
+ 		/* Need one more descriptor for virtio header. */
+@@ -804,6 +970,8 @@ virtio_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
+ 					PMD_TX_LOG(ERR, "virtqueue_enqueue error: %d", error);
+ 				break;
+ 			}
++			if (nb_tx < nb_pkts-1)
++				rte_prefetch0((void *)tx_pkts[nb_tx+1]);
+ 			nb_tx++;
+ 			txvq->bytes += txm->pkt_len;
+ 		} else {
+@@ -811,6 +979,11 @@ virtio_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
+ 			break;
+ 		}
+ 	}
++	time[2] = read_tsc();
++	if (once < 140) {
++		// printf("%llx %llx %llx", time[0], time[1], time[2]);
++		printf("%llu %llu\n", time[1] - time[0], time[2] - time[1]);
++	}
+ 
+ 	txvq->packets += nb_tx;
+ 
+diff --git a/examples/npktgen/Makefile b/examples/npktgen/Makefile
+new file mode 100644
+index 0000000..93b4a9d
+--- /dev/null
++++ b/examples/npktgen/Makefile
+@@ -0,0 +1,50 @@
++#   BSD LICENSE
++# 
++#   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
++#   All rights reserved.
++# 
++#   Redistribution and use in source and binary forms, with or without
++#   modification, are permitted provided that the following conditions
++#   are met:
++# 
++#     * Redistributions of source code must retain the above copyright
++#       notice, this list of conditions and the following disclaimer.
++#     * Redistributions in binary form must reproduce the above copyright
++#       notice, this list of conditions and the following disclaimer in
++#       the documentation and/or other materials provided with the
++#       distribution.
++#     * Neither the name of Intel Corporation nor the names of its
++#       contributors may be used to endorse or promote products derived
++#       from this software without specific prior written permission.
++# 
++#   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++#   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++#   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++#   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++#   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++#   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++#   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++#   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++#   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++#   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++#   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++ifeq ($(RTE_SDK),)
++$(error "Please define RTE_SDK environment variable")
++endif
++
++# Default target, can be overriden by command line or environment
++RTE_TARGET ?= x86_64-native-linuxapp-gcc
++
++include $(RTE_SDK)/mk/rte.vars.mk
++
++# binary name
++APP = pktgen
++
++# all source are stored in SRCS-y
++SRCS-y := main.c alignpool.c
++
++CFLAGS += -O3
++CFLAGS += $(WERROR_FLAGS)
++
++include $(RTE_SDK)/mk/rte.extapp.mk
+diff --git a/examples/npktgen/README.md b/examples/npktgen/README.md
+new file mode 100644
+index 0000000..31b00df
+--- /dev/null
++++ b/examples/npktgen/README.md
+@@ -0,0 +1,95 @@
++
++Usage
++=====
++
++Build and run this application
++
++	make RTE_SDK=/path/to/dpdk-sdk RTE_TARGET=build
++	sudo ./build/pktgen -c fff -n 4 -- -c config -b 1 -f tx              # Send udp packet
++	sudo ./build/pktgen -c fff -n 4 -- -c config -b 1 -f tx -t tracelist # Send tcp packet from pcap file.
++	sudo ./build/pktfen -c fff -n 4 -- -c config -b 1 -f rx
++
++
++TODO
++====
++
++- Add sanity_check() after parse_args()
++    -c and -f tx
++    -l and -f tx
++
++- Add a description of the correctness of send logic.
++  (order and no drop)
++
++- Add -c count (Hard to implement to keep code clean and high performance)
++
++- Understand RSS.
++- Understand memory channel.
++
++
++ChangeLog
++=========
++
++- Add '-t trace list file' option to specify the pcap file to be sent.
++
++- Add '-p packet size' (udp packet length) option
++
++- Add '-b burst size' option
++
++- Add '-l loop count' option to provide the method to slow tx speed down.
++
++- Correct the calculation of sent and received bytes.
++
++- Add '-i interval' option to specify the interval of updating stats.
++
++- Add sanity_check() which will be called after parse_args() to check the
++  correctness of arguments specified through the command line.
++
++- Add -c option to setup the cores configuration by reading
++  from configuration file. Configuration file format likes this:
++
++    #
++    # There are six cores and two ports are used.
++    # And there are three queues are enabled for each port.
++    #
++
++    # Settings for NIC-0
++    core_id=0,port_id=0,queue_id=0 # Cpu0 manages the queue 0 of NIC-0
++    core_id=1,port_id=0,queue_id=1
++    core_id=2,port_id=0,queue_id=2
++
++    # Settings for NIC-1
++    core_id=3,port_id=1,queue_id=0
++    core_id=4,port_id=1,queue_id=1
++    core_id=5,port_id=1,queue_id=2
++
++  Empty line and comments (Anything after #) are supported.
++
++
++NOTICE
++======
++
++To replay tcp, all packets in pcap should be sent in order correctly,
++so, pcap files should be sent in correct order.
++
++
++All enjoyable things
++====================
++
++1. The high speed of sending and receiving packets;
++2. The correctness of each number (number of packets and bytes);
++3. The human friendly information and statistics;
++
++
++The experience can be got
++=========================
++
++1. Maybe only a few codes, then a wonderful function will be got.
++2. Make a excellent framework, then everything can benefit from it
++   easily and naturally.
++
++PS. I love to write codes.
++
++
++Elegant source code (code architecture and effeciency), handy command
++line argments and outputs -- Wonderful using experience.
++
+diff --git a/examples/npktgen/alignpool.c b/examples/npktgen/alignpool.c
+new file mode 100644
+index 0000000..b455bd6
+--- /dev/null
++++ b/examples/npktgen/alignpool.c
+@@ -0,0 +1,74 @@
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <stdint.h>
++#include <errno.h>
++#include <sys/queue.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++
++#include <rte_memory.h>
++#include <rte_memzone.h>
++#include <rte_mempool.h>
++#include <rte_launch.h>
++#include <rte_eal.h>
++#include <rte_errno.h>
++#include <rte_per_lcore.h>
++#include <rte_lcore.h>
++#include <rte_debug.h>
++
++#include "alignpool.h"
++
++/* The objsize is 4096, and all objs aligned to 4096 */
++#define OBJSIZE 4096
++struct rte_mempool *
++my_get_aligned_mempool(const char *name, unsigned n,
++		unsigned cache_size, unsigned private_data_size,
++		rte_mempool_ctor_t *mp_init, void *mp_init_arg,
++		rte_mempool_obj_ctor_t *obj_init, void *obj_init_arg,
++		int socket_id, unsigned flags)
++	/* TODO remove flags */
++{
++	char mz_name[RTE_MEMZONE_NAMESIZE];
++	const struct rte_memzone *mz;
++	struct rte_mempool *mp;
++	unsigned elt_size;
++	unsigned long long addr[2];
++	phys_addr_t *pa;
++	int hc_fd;
++	int ret;
++
++	snprintf(mz_name, RTE_MEMZONE_NAMESIZE, "%s%s", "myzone_", name);
++	mz = rte_memzone_reserve_aligned(mz_name, n*OBJSIZE, socket_id, flags, OBJSIZE);
++	if (mz == NULL) {
++		return NULL;
++	}
++	if (likely((pa = calloc(1, sizeof(*pa))) != NULL)) {
++		*pa = mz->phys_addr;
++	} else {
++		return NULL;
++	}
++	hc_fd = open("/dev/kvm-hypercall", 0);
++	if (hc_fd < 0) {
++		perror("open kvm-hypercall");
++		return NULL;
++	}
++	addr[0] = mz->phys_addr;
++	addr[1] = mz->len;
++	ret = ioctl(hc_fd, 0, addr);
++	sleep(2);
++	// sleep wait for ioctl to complete.
++	fprintf(stderr, "hc_fd: %d\n", ret);
++#ifdef RTE_LIBRTE_MEMPOOL_DEBUG
++	elt_size = OBJSIZE - 64 - 64;
++#else
++	elt_size = OBJSIZE - 64;
++#endif
++	mp = rte_mempool_xmem_create(name, n, elt_size, cache_size,
++			private_data_size, mp_init, mp_init_arg, obj_init,
++			obj_init_arg, socket_id, MEMPOOL_F_NO_SPREAD,
++			(void *)mz->addr, pa, 1, 64-1);
++	return mp;
++}
+diff --git a/examples/npktgen/alignpool.h b/examples/npktgen/alignpool.h
+new file mode 100644
+index 0000000..ec31f0d
+--- /dev/null
++++ b/examples/npktgen/alignpool.h
+@@ -0,0 +1,11 @@
++#ifndef _ALIGNPOOL_H_
++#define _ALIGNPOOL_H_
++
++struct rte_mempool *
++my_get_aligned_mempool(const char *name, unsigned n,
++		unsigned cache_size, unsigned private_data_size,
++		rte_mempool_ctor_t *mp_init, void *mp_init_arg,
++		rte_mempool_obj_ctor_t *obj_init, void *obj_init_arg,
++		int socket_id, unsigned flags);
++
++#endif
+diff --git a/examples/npktgen/config b/examples/npktgen/config
+new file mode 100644
+index 0000000..f21c3b9
+--- /dev/null
++++ b/examples/npktgen/config
+@@ -0,0 +1,21 @@
++
++#
++# There are six cores and two ports are used.
++# And there are three queues are enabled for each port.
++#
++
++# Settings for NIC-0
++core_id=0,port_id=0,queue_id=0 # Cpu0 manages the queue 0 of NIC-0
++#core_id=1,port_id=0,queue_id=1
++#core_id=2,port_id=0,queue_id=2
++#core_id=3,port_id=0,queue_id=3
++#core_id=4,port_id=0,queue_id=4 # Cpu0 manages the queue 0 of NIC-0
++#core_id=5,port_id=0,queue_id=5
++#core_id=6,port_id=0,queue_id=6
++#core_id=7,port_id=0,queue_id=7
++
++# Settings for NIC-1
++#core_id=3,port_id=1,queue_id=0
++#core_id=4,port_id=1,queue_id=1
++#core_id=5,port_id=1,queue_id=2
++
+diff --git a/examples/npktgen/main.c b/examples/npktgen/main.c
+new file mode 100644
+index 0000000..bbe213b
+--- /dev/null
++++ b/examples/npktgen/main.c
+@@ -0,0 +1,1289 @@
++/*-
++ *   BSD LICENSE
++ *
++ *   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
++ *   All rights reserved.
++ *   Copyright(c) 2014-2015 Tiwei Bie (btw@FreeBSD.org). All rights reserved.
++ *   All rights reserved.
++ *
++ *   Redistribution and use in source and binary forms, with or without
++ *   modification, are permitted provided that the following conditions
++ *   are met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *       notice, this list of conditions and the following disclaimer in
++ *       the documentation and/or other materials provided with the
++ *       distribution.
++ *     * Neither the name of Intel Corporation nor the names of its
++ *       contributors may be used to endorse or promote products derived
++ *       from this software without specific prior written permission.
++ *
++ *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <inttypes.h>
++#include <string.h>
++#include <sys/queue.h>
++#include <stdarg.h>
++#include <errno.h>
++#include <getopt.h>
++#include <assert.h>
++
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <signal.h>
++#include <sys/time.h>
++#include <sys/param.h>
++#include <sys/mman.h>
++
++#include <pcap/pcap.h>
++
++#include <rte_common.h>
++#include <rte_log.h>
++#include <rte_memory.h>
++#include <rte_memcpy.h>
++#include <rte_memzone.h>
++#include <rte_tailq.h>
++#include <rte_eal.h>
++#include <rte_per_lcore.h>
++#include <rte_launch.h>
++#include <rte_atomic.h>
++#include <rte_lcore.h>
++#include <rte_branch_prediction.h>
++#include <rte_interrupts.h>
++#include <rte_pci.h>
++#include <rte_debug.h>
++#include <rte_ether.h>
++#include <rte_ethdev.h>
++#include <rte_ring.h>
++#include <rte_log.h>
++#include <rte_mempool.h>
++#include <rte_mbuf.h>
++#include <rte_string_fns.h>
++#include <rte_cycles.h>
++
++//#define DEBUG_CONFIG_FILE
++
++#define ADDRDBG 0
++
++static bool build_udp_packet(char *buf, int *pkt_size, uint64_t *seed);
++static bool build_tcp_packet(char *buf, int *pkt_size,
++		 __attribute__((unused)) uint64_t *seed);
++
++#ifndef __FAVOR_BSD
++#define __FAVOR_BSD /* For uh_ prefix in struct udphdr */
++#endif
++//#include <net/ethernet.h> /* conflict with rte_ether.h */
++#include <netinet/in.h>
++#include <netinet/ip.h>
++#include <netinet/udp.h>
++
++/* Macros for printing using RTE_LOG */
++#define RTE_LOGTYPE_APP RTE_LOGTYPE_USER1
++#define FATAL_ERROR(fmt, args...)       rte_exit(EXIT_FAILURE, fmt "\n", ##args)
++#define PRINT_INFO(fmt, args...)        RTE_LOG(INFO, APP, fmt "\n", ##args)
++
++/* Max ports that can be used (each port is associated with at least one lcore) */
++#define MAX_PORTS               RTE_MAX_LCORE
++
++/* Max queues that can be used (each queue is associated with exactly one lcore) */
++#define MAX_QUEUES		16
++
++/* Max size of a single packet */
++#define MAX_PACKET_SZ           2048
++
++/* Number of bytes needed for each mbuf */
++#define MBUF_SZ \
++	(MAX_PACKET_SZ + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
++
++/* Number of mbufs in mempool that is created */
++#define NB_MBUF                 8192
++
++/* How many packets to attempt to read from NIC in one go */
++#define PKT_BURST_SZ            32
++
++/* How many objects (mbufs) to keep in per-lcore mempool cache */
++#define MEMPOOL_CACHE_SZ        PKT_BURST_SZ
++
++/* Number of RX ring descriptors */
++#define NB_RXD                  128
++
++/* Number of TX ring descriptors */
++#define NB_TXD                  512
++
++/*
++ * RX and TX Prefetch, Host, and Write-back threshold values should be
++ * carefully set for optimal performance. Consult the network
++ * controller's datasheet and supporting DPDK documentation for guidance
++ * on how these parameters should be set.
++ */
++/* RX ring configuration */
++static const struct rte_eth_rxconf rx_conf = {
++	.rx_thresh = {
++		.pthresh = 8,   /* Ring prefetch threshold */
++		.hthresh = 8,   /* Ring host threshold */
++		.wthresh = 4,   /* Ring writeback threshold */
++	},
++	.rx_free_thresh = 0,    /* Immediately free RX descriptors */
++};
++
++/*
++ * These default values are optimized for use with the Intel(R) 82599 10 GbE
++ * Controller and the DPDK ixgbe PMD. Consider using other values for other
++ * network controllers and/or network drivers.
++ */
++/* TX ring configuration */
++static const struct rte_eth_txconf tx_conf = {
++	.tx_thresh = {
++		.pthresh = 36,  /* Ring prefetch threshold */
++		.hthresh = 0,   /* Ring host threshold */
++		.wthresh = 0,   /* Ring writeback threshold */
++	},
++	.tx_free_thresh = 0,    /* Use PMD default values */
++	.tx_rs_thresh = 0,      /* Use PMD default values */
++};
++
++/* Options for configuring ethernet port */
++static const struct rte_eth_conf port_conf = {
++	.rxmode = {
++		.mq_mode = ETH_MQ_RX_RSS,
++		.max_rx_pkt_len = ETHER_MAX_LEN,
++		.header_split   = 0,   /* Header Split disabled */
++		.hw_ip_checksum = 0,   /* IP checksum offload disabled */
++		.hw_vlan_filter = 0,   /* VLAN filtering disabled */
++		.jumbo_frame    = 0,   /* Jumbo Frame Support disabled */
++		.hw_strip_crc   = 0,   /* CRC stripped by hardware */
++	},
++	.rx_adv_conf = {
++		.rss_conf = {
++			.rss_key = NULL,
++			.rss_hf = ETH_RSS_IPV4,
++		},
++	},
++	.txmode = {
++		.mq_mode = ETH_MQ_TX_NONE,
++	},
++};
++
++/* Mempool for mbufs */
++static struct rte_mempool *pktmbuf_pool = NULL;
++
++static uint64_t cores_mask = 0;
++static uint64_t ports_mask = 0;
++static uint64_t queues_masks[MAX_PORTS] = { 0 };
++
++struct core_conf {
++	uint8_t core_id;
++	uint8_t port_id;
++	uint8_t queue_id;
++};
++
++/* Array storing port_id and queue_id that are associated with each lcore */
++static struct core_conf cores_conf[MAX_PORTS * MAX_QUEUES];
++static int nb_cores_conf = 0;
++
++#define ARRAY_SIZE(array) (sizeof(array)/sizeof(array[0]))
++
++/* Structure type for recording lcore-specific stats */
++struct stats {
++	uint64_t rx_pkts;
++	uint64_t rx_bytes;
++
++	uint64_t tx_pkts;
++	uint64_t tx_bytes;
++
++	uint64_t tx_total_pkts;
++	uint64_t tx_total_bytes;
++
++	uint64_t rx_total_pkts;
++	uint64_t rx_total_bytes;
++} __attribute__((aligned(64)));;
++
++/* Array of lcore-specific stats */
++static struct stats lcore_stats[RTE_MAX_LCORE];
++static short port_ids[RTE_MAX_LCORE];
++static short queue_ids[RTE_MAX_LCORE];
++
++static enum {
++	TX = 0,
++	RX
++} func;
++
++static struct timeval last_time[RTE_MAX_LCORE] __attribute__((aligned(64)));
++
++static bool npkt_limit = false;
++
++static int32_t opt_pkt_nb     = 0;
++static int32_t opt_pkt_size   = 60;
++static int32_t opt_burst_size = 3;
++static int32_t opt_loop_count = 0;
++static int32_t opt_interval   = 3000000;
++
++typedef bool (*build_packet_t)(char *buf, int *pkt_size, uint64_t *seed);
++static build_packet_t build_packet = build_udp_packet;
++
++struct file_cache {
++	char filename[MAXPATHLEN];
++	char *fcache;
++	uint64_t offset;
++	uint64_t size;
++	struct pcap_file_header hdr;
++	struct file_cache *next;
++} __attribute__((aligned(64)));;
++
++struct file_cache *lcore_file_cache[RTE_MAX_LCORE] = { NULL };
++static char tracefilelist[MAXPATHLEN] = { 0 };
++
++#define MAX_PKT_LEN	(1512 + 4)
++
++/* Print out statistics on packets handled */
++static void
++print_stats(void)
++{
++	unsigned i;
++	uint64_t total_pkts = 0;
++	uint64_t total_bytes = 0;
++
++	if (func == RX) {
++		printf("\n**Pktgen statistics**\n"
++		       "=======  ======  ======= ============  ==============\n"
++		       " Lcore    Port    Queue   RX Packets        RX Bytes \n"
++		       "-------  ------  ------- ------------  --------------\n");
++		RTE_LCORE_FOREACH(i) {
++			if (!((1ULL << i) & cores_mask)) {
++				printf("%6u %7c %8c %12c %15c\n",
++				       i, '-', '-', '-', '-');
++				continue;
++			}
++			lcore_stats[i].rx_total_pkts  += lcore_stats[i].rx_pkts;
++			lcore_stats[i].rx_total_bytes += lcore_stats[i].rx_bytes;
++
++			printf("%6u %7d %8d %12"PRIu64" %15"PRIu64"\n",
++			       i, port_ids[i], queue_ids[i],
++			       lcore_stats[i].rx_total_pkts,
++			       lcore_stats[i].rx_total_bytes);
++
++			total_pkts  += lcore_stats[i].rx_total_pkts;
++			total_bytes += lcore_stats[i].rx_total_bytes;
++		}
++	} else {
++		printf("\n**Pktgen statistics**\n"
++		       "=======  ======  ======= ============  ==============\n"
++		       " Lcore    Port    Queue   TX Packets        TX Bytes \n"
++		       "-------  ------  ------- ------------  --------------\n");
++		RTE_LCORE_FOREACH(i) {
++			if (!((1ULL << i) & cores_mask)) {
++				printf("%6u %7c %8c %12c %15c\n",
++				       i, '-', '-', '-', '-');
++				continue;
++			}
++			lcore_stats[i].tx_total_pkts  += lcore_stats[i].tx_pkts;
++			lcore_stats[i].tx_total_bytes += lcore_stats[i].tx_bytes;
++
++			printf("%6u %7d %8d %12"PRIu64" %15"PRIu64"\n",
++			       i, port_ids[i], queue_ids[i],
++			       lcore_stats[i].tx_total_pkts,
++			       lcore_stats[i].tx_total_bytes);
++
++			total_pkts  += lcore_stats[i].tx_total_pkts;
++			total_bytes += lcore_stats[i].tx_total_bytes;
++		}
++	}
++	printf("%6s %7c %8c %12"PRIu64" %15"PRIu64"\n", "Total",
++	       '-', '-', total_pkts, total_bytes);
++	printf("=======  ======  ======= ============  ==============\n");
++}
++
++static void
++update_rx_stats(int count)
++{
++	unsigned int lcore_id = rte_lcore_id();
++	struct timeval tv;
++	double sec_diff;
++	double bps, pps;
++	uint64_t rx_pkts = lcore_stats[lcore_id].rx_pkts;
++	uint64_t rx_bytes = lcore_stats[lcore_id].rx_bytes;
++
++	gettimeofday(&tv, NULL);
++
++	sec_diff  = tv.tv_sec  - last_time[lcore_id].tv_sec;
++	sec_diff += (tv.tv_usec - last_time[lcore_id].tv_usec) / 1000000.0;
++	assert(sec_diff != 0);
++
++	/*
++	 * Raw packets have 4 bytes crc + 20 bytes framing, this is
++	 * where '+ rx_pkts * 24' comes from. Note, This is only used
++	 * to calculate the transmit speed. And it is not counted into
++	 * the total bytes in final statistics in print_stats(), which
++	 * only contains the total bytes of ether header, ip header,
++	 * tcp/udp header, and payload.
++	 */
++	pps = rx_pkts / sec_diff;
++	bps = ((rx_bytes + rx_pkts * 24) * 8.0) / sec_diff;
++
++	printf("Lcore %2u: %2.3f Mpps, %3.3f Gbps "
++		"(%ld packets per chunk) in %6.4f sec\n",
++		lcore_id, pps / 1000000.0, bps / 1000000000.0,
++		lcore_stats[lcore_id].rx_pkts / count, sec_diff);
++
++	last_time[lcore_id] = tv;
++}
++
++static void
++update_tx_stats(int count)
++{
++	unsigned int lcore_id = rte_lcore_id();
++	struct timeval tv;
++	double sec_diff;
++	double bps, pps;
++	uint64_t tx_pkts = lcore_stats[lcore_id].tx_pkts;
++	uint64_t tx_bytes = lcore_stats[lcore_id].tx_bytes;
++
++	gettimeofday(&tv, NULL);
++
++	sec_diff  = tv.tv_sec  - last_time[lcore_id].tv_sec;
++	sec_diff += (tv.tv_usec - last_time[lcore_id].tv_usec) / 1000000.0;
++	assert(sec_diff != 0);
++
++	/*
++	 * Raw packets have 4 bytes crc + 20 bytes framing, this is
++	 * where '+ tx_pkts * 24' comes from. Note, This is only used
++	 * to calculate the transmit speed. And it is not counted into
++	 * the total bytes in final statistics in print_stats(), which
++	 * only contains the total bytes of ether header, ip header,
++	 * tcp/udp header, and payload.
++	 */
++	pps = tx_pkts / sec_diff;
++	bps = ((tx_bytes + tx_pkts * 24) * 8.0) / sec_diff;
++
++	printf("Lcore %2u: %2.3f Mpps, %3.3f Gbps "
++		"(%ld packets per chunk) in %6.4f sec\n",
++		lcore_id, pps / 1000000.0, bps / 1000000000.0,
++		lcore_stats[lcore_id].tx_pkts / count, sec_diff);
++
++	last_time[lcore_id] = tv;
++}
++
++/* Custom handling of signals to handle stats */
++static void
++signal_handler(int signum)
++{
++	/* When we receive a USR1 signal, print stats */
++	if (signum == SIGUSR1) {
++		print_stats();
++	}
++
++	if (signum == SIGINT) {
++		print_stats();
++		exit(EXIT_SUCCESS);
++	}
++
++	/* When we receive a USR2 signal, reset stats */
++	if (signum == SIGUSR2) {
++		memset(&lcore_stats, 0, sizeof(lcore_stats));
++		printf("\n**Statistics have been reset**\n");
++		return;
++	}
++}
++
++static inline uint32_t
++myrand(uint64_t *seed)
++{
++	*seed = *seed * 1103515245 + 12345;
++	return (uint32_t)(*seed >> 32);
++}
++
++#if 0
++static void
++dump_packet(char *buf, int pkt_size)
++{
++	struct ether_hdr *eh = (struct ether_hdr *)buf;
++	struct ip *ip = (struct ip *)(eh + 1);
++	struct udphdr *udp = (struct udphdr *)(ip + 1);
++	char *payload = (char *)(udp + 1);
++
++	(void)pkt_size; // Check with ip->ip_len.
++
++	printf("---------------------------------------\n");
++
++#define TEST_INT(m) printf("%s: %d\n", #m, m)
++	TEST_INT(ip->ip_v);
++	TEST_INT(ip->ip_hl);
++	TEST_INT(ntohs(ip->ip_len));
++	TEST_INT(ip->ip_id);
++	TEST_INT(ip->ip_off);
++	TEST_INT(ip->ip_ttl);
++
++	printf("ip->ip_p: %s\n", ip->ip_p == IPPROTO_UDP ? "udp" :
++				(ip->ip_p == IPPROTO_TCP ? "tcp" : "unknown"));
++
++#define TEST_IP(m) printf("%s: %d.%d.%d.%d\n", #m, \
++		(m & 0xff000000) >> 24, (m & 0x00ff0000) >> 16, \
++		(m & 0x0000ff00) >>  8, (m & 0x000000ff) >>  0);
++
++	TEST_IP(ntohl(ip->ip_dst.s_addr));
++	TEST_IP(ntohl(ip->ip_src.s_addr));
++	TEST_INT(ip->ip_sum);
++
++	TEST_INT(udp->uh_sport);
++	TEST_INT(udp->uh_dport);
++	TEST_INT(ntohs(udp->uh_ulen));
++	TEST_INT(udp->uh_sum);
++
++	printf("payload: %s\n", payload);
++}
++#endif
++
++static bool
++build_udp_packet(char *buf, int *pkt_size, uint64_t *seed)
++{
++	//struct ether_header *eh = (struct ether_header *)buf;
++	struct ether_hdr *eh = (struct ether_hdr *)buf;
++	struct ip *ip = (struct ip *)(eh + 1);
++	struct udphdr *udp = (struct udphdr *)(ip + 1);
++	char *payload = (char *)(udp + 1);
++
++	eh->d_addr.addr_bytes[0] = 0x00;
++	eh->d_addr.addr_bytes[1] = 0x00;
++	eh->d_addr.addr_bytes[2] = 0x00;
++	eh->d_addr.addr_bytes[3] = 0x00;
++	eh->d_addr.addr_bytes[4] = 0x00;
++	eh->d_addr.addr_bytes[5] = 0x01;
++
++	eh->s_addr.addr_bytes[0] = 0x00;
++	eh->s_addr.addr_bytes[1] = 0x00;
++	eh->s_addr.addr_bytes[2] = 0x00;
++	eh->s_addr.addr_bytes[3] = 0x00;
++	eh->s_addr.addr_bytes[4] = 0x00;
++	eh->s_addr.addr_bytes[5] = 0x02;
++
++	eh->ether_type = htons(ETHER_TYPE_IPv4);
++
++	ip->ip_v = IPVERSION;
++	ip->ip_hl = 5;
++	ip->ip_tos = IPTOS_LOWDELAY;
++	/*
++	 * x86/endian.h:
++	 *
++	 * #define __htonl(x)      __bswap32(x)
++	 * #define __htons(x)      __bswap16(x)
++	 * #define __ntohl(x)      __bswap32(x)
++	 * #define __ntohs(x)      __bswap16(x)
++	 *
++	 * htonX() and ntohX() is same, so, it's easy to understand
++	 * the ntohs() here.
++	 */
++	ip->ip_len = ntohs(*pkt_size - sizeof(*eh));
++	ip->ip_id = 0;
++	ip->ip_off = htons(IP_DF); /* Don't fragment */
++	ip->ip_ttl = IPDEFTTL;
++	ip->ip_p = IPPROTO_UDP;
++	ip->ip_dst.s_addr = htonl(0x0a0a0a01);
++	ip->ip_src.s_addr = htonl(myrand(seed));
++	ip->ip_sum = 0;
++
++	udp->uh_sport = htons(myrand(seed));
++	udp->uh_dport = htons(myrand(seed));
++	udp->uh_ulen = htons(*pkt_size - sizeof(*eh) - sizeof(*ip));
++	udp->uh_sum = 0;
++
++	*(payload +  0) = 'h';
++	*(payload +  1) = 'e';
++	*(payload +  2) = 'l';
++	*(payload +  3) = 'l';
++	*(payload +  4) = 'o';
++	*(payload +  5) = ',';
++	*(payload +  6) = ' ';
++	*(payload +  7) = 'w';
++	*(payload +  8) = 'o';
++	*(payload +  9) = 'r';
++	*(payload + 10) = 'l';
++	*(payload + 11) = 'd';
++	*(payload + 12) = '.';
++	*(payload + 13) = '\0';
++
++	//dump_packet(buf, *pkt_size);
++
++	return (true);
++}
++
++static bool
++build_tcp_packet(char *buf, int *pkt_size,
++		 __attribute__((unused)) uint64_t *seed)
++{
++	const unsigned lcore_id = rte_lcore_id();
++	struct file_cache *fc = lcore_file_cache[lcore_id];
++
++	struct pcap_pkthdr_ondisk {
++		uint32_t ts_sec;
++		uint32_t ts_usec;
++		uint32_t caplen;
++		uint32_t len;
++	} *pcap_hdr;
++
++	int32_t caplen;
++	char *pktdata;
++
++	if (fc->offset == fc->size) {
++		printf("Send file %s complete\n", fc->filename);
++
++		if (munmap(fc->fcache, fc->size) == -1) {
++			fprintf(stderr, "munmap: %s\n", strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++
++		fc = fc->next;
++		if (fc == NULL) {
++			printf("All trace files assigned to Lcore %u "
++			       "are sent.\n", lcore_id);
++			return (false);
++		}
++
++		lcore_file_cache[lcore_id] = fc;
++	}
++
++	pcap_hdr = (struct pcap_pkthdr_ondisk *)(fc->fcache + fc->offset);
++	caplen = pcap_hdr->caplen;
++	pktdata = (char *)(pcap_hdr + 1);
++
++	fc->offset += sizeof(*pcap_hdr) + caplen;
++
++	if (caplen > MAX_PKT_LEN) {
++		fprintf(stderr, "Wrong packet length %u at offset %lu in %s\n",
++		       caplen, fc->offset, fc->filename);
++		exit(EXIT_FAILURE);
++	}
++
++	if (fc->offset > fc->size) {
++		fprintf(stderr, "Last packet is thrown away in %s\n",
++			fc->filename);
++		exit(EXIT_FAILURE);
++	}
++
++	*pkt_size = caplen;
++	memcpy(buf, pktdata, caplen);
++
++	return (true);
++}
++
++static inline void
++ia32_pause(void)
++{
++	__asm __volatile("pause");
++}
++
++/* Main processing loop */
++static int
++main_loop(__attribute__((unused)) void *arg)
++{
++	const unsigned lcore_id = rte_lcore_id();
++	int port_id = -1, queue_id = -1;
++	int i;
++	int num_cnt = 0;
++	uint64_t seed = time(NULL) + lcore_id;
++	bool looping = true;
++
++	if (!((1ULL << lcore_id) & cores_mask)) {
++		PRINT_INFO("Lcore %u has nothing to do (not configured)",
++			   lcore_id);
++		return (0);
++	}
++
++	if (func == TX && build_packet == build_tcp_packet &&
++	    lcore_file_cache[lcore_id] == NULL) {
++		PRINT_INFO("Lcore %u has nothing to do (no trace file "
++			   "assigned)", lcore_id);
++		return (0);
++	}
++
++	for (i = 0; i < nb_cores_conf; i++) {
++		if (lcore_id == cores_conf[i].core_id) {
++			port_id = cores_conf[i].port_id;
++			queue_id = cores_conf[i].queue_id;
++			break;
++		}
++	}
++
++	if (port_id == -1)
++		FATAL_ERROR("Configurations for lcore %u is not found",
++			    lcore_id);
++
++	port_ids[lcore_id] = port_id;
++	queue_ids[lcore_id] = queue_id;
++
++	gettimeofday(&last_time[lcore_id], NULL);
++
++	if (func == RX) {
++		PRINT_INFO("Lcore %u is reading from port %u, queue %u",
++		           lcore_id, port_id, queue_id);
++		fflush(stdout);
++		/* Loop forever reading from NIC */
++		for (;;) {
++			struct rte_mbuf *pkts_burst[PKT_BURST_SZ];
++			unsigned i;
++			const unsigned nb_rx =
++					rte_eth_rx_burst(port_id, queue_id,
++					    pkts_burst, PKT_BURST_SZ);
++			lcore_stats[lcore_id].rx_pkts += nb_rx;
++#if ADDRDBG
++			if (nb_rx != 0) {
++				printf("receive %d pkts\n", nb_rx);
++				printf("sizeof rte_mbuf: %lu\n", sizeof(struct rte_mbuf));
++			}
++#endif
++			for (i = 0; likely(i < nb_rx); i++) {
++				struct rte_mbuf *m = pkts_burst[i];
++				uint64_t len = rte_pktmbuf_data_len(m);
++				lcore_stats[lcore_id].rx_bytes += len;
++				//dump_packet(rte_pktmbuf_mtod(m, void *), len);
++#if ADDRDBG
++				printf("%d:\nrte_mbuf addr: %p, %llu\n"
++				       "rte_mbuf data addr: %p, %llu\n"
++				       "rte_mbuf offset of pktmbuf_pool: %p, %llu\n",
++				       i, m, (unsigned long long)m,
++				       rte_pktmbuf_mtod(m, void *),
++				       (unsigned long long)rte_pktmbuf_mtod(m, void *),
++				       (void *)((char *)m - (char *)pktmbuf_pool),
++				       (unsigned long long)((char *)m - (char *)pktmbuf_pool));
++				printf("rte_mbuf %llu + mbufsize %lu = %llu\n",
++				       (unsigned long long)m, sizeof(struct rte_mbuf),
++				       (unsigned long long)m + sizeof(struct rte_mbuf));
++#endif
++				rte_pktmbuf_free(m);
++			}
++
++			if (nb_rx != 0 && ++num_cnt == opt_interval) {
++				lcore_stats[lcore_id].rx_total_pkts +=
++					lcore_stats[lcore_id].rx_pkts;
++				lcore_stats[lcore_id].rx_total_bytes +=
++					lcore_stats[lcore_id].rx_bytes;
++				update_rx_stats(num_cnt);
++				lcore_stats[lcore_id].rx_pkts = 0;
++				lcore_stats[lcore_id].rx_bytes = 0;
++				num_cnt = 0;
++			}
++		}
++	} else {
++		PRINT_INFO("Lcore %u is writing to port %u, queue %u",
++		           lcore_id, port_id, queue_id);
++		fflush(stdout);
++		/* Loop writing to NIC */
++		while (likely(looping)) {
++			int ret;
++			int32_t burst_size = opt_burst_size;
++			int32_t pkt_size = opt_pkt_size;
++			struct rte_mbuf *pkts_burst[PKT_BURST_SZ];
++			struct rte_mbuf *m;
++			struct rte_mbuf **mm;
++			if (npkt_limit && opt_pkt_nb <= 0)
++				break;
++			for (i = 0; i < burst_size; i++) {
++				do {
++					m = rte_pktmbuf_alloc(pktmbuf_pool);
++				} while (unlikely(m == NULL));
++
++				if (unlikely(!((*build_packet)(
++						rte_pktmbuf_mtod(m, void *),
++						&pkt_size, &seed)))) {
++					rte_pktmbuf_free(m);
++					burst_size = i;
++					looping = false;
++					break;
++				}
++
++				m->nb_segs = 1;
++				m->next = NULL;
++				m->pkt_len  = pkt_size;
++				m->data_len = pkt_size;
++
++				pkts_burst[i] = m;
++				lcore_stats[lcore_id].tx_bytes += pkt_size;
++			}
++			lcore_stats[lcore_id].tx_pkts += burst_size;
++
++			mm = pkts_burst;
++			while (1) {
++				/*
++				 * Failed packets has to been resent.
++				 * Because when sending pcap files,
++				 * all packets should be sent correctly
++				 * in order.
++				 */
++				ret = rte_eth_tx_burst(port_id, queue_id, mm,
++						       burst_size);
++				if (likely(ret == burst_size))
++					break;
++				mm += ret;
++				burst_size -= ret;
++				//lcore_stats[lcore_id].dropped++;
++			}
++
++			if (++num_cnt == opt_interval) {
++				lcore_stats[lcore_id].tx_total_pkts +=
++					lcore_stats[lcore_id].tx_pkts;
++				lcore_stats[lcore_id].tx_total_bytes +=
++					lcore_stats[lcore_id].tx_bytes;
++				update_tx_stats(num_cnt);
++				lcore_stats[lcore_id].tx_pkts = 0;
++				lcore_stats[lcore_id].tx_bytes = 0;
++				num_cnt = 0;
++			}
++			if (npkt_limit) {
++				opt_pkt_nb -= burst_size;
++				if (opt_pkt_nb <= 0)
++					break;
++			}
++
++			for (i = 0; unlikely(i < opt_loop_count); i++)
++				ia32_pause();
++		}
++	}
++
++	PRINT_INFO("Lcore %u has done the job, exiting.", lcore_id);
++	return (0);
++}
++
++/* Display usage instructions */
++static void
++print_usage(const char *prgname)
++{
++	PRINT_INFO("\nUsage: %s [EAL options] -- -f tx|rx -t tracelist -b\n"
++	           "    -t traicelist : trace list to send\n"
++	           "    -p packet size: packet size to generate (udp only)\n"
++	           "    -b burst size : burst size to use\n"
++	           "    -l loop count : number of loops to loop in each tx\n"
++	           "    -i interval   : interval during two update stats\n"
++	           "    -f tx|rx      : function to use\n",
++	           prgname);
++}
++
++/*
++static void
++parse_cores_and_ports(const char *optarg)
++{
++	unsigned lcore_id, port_id;
++	char *p;
++
++	while ((p = strchr(optarg, ',')) != NULL) {
++		*p = '\0';
++		sscanf(optarg, "%u:%u", &lcore_id, &port_id);
++		port_ids[lcore_id] = port_id;
++		cores_mask |= (1 << lcore_id);
++		optarg = p + 1;
++	}
++	sscanf(optarg, "%u:%u", &lcore_id, port_id);
++	port_ids[lcore_id] = port_id;
++	cores_mask |= (1 << lcore_id);
++}
++
++static uint64_t
++parse_cores_and_queues(const char *optarg)
++{
++	unsigned lcore_id, queue_id;
++	char *p;
++
++	while ((p = strchr(optarg, ',')) != NULL) {
++		*p = '\0';
++		sscanf(optarg, "%u:%u", &lcore_id, &queue_id);
++		queue_ids[lcore_id] = queue_id;
++		cores_mask |= (1 << lcore_id);
++		optarg = p + 1;
++	}
++	sscanf(optarg, "%u:%u", &lcore_id, port_id);
++	port_ids[lcore_id] = port_id;
++	cores_mask |= (1 << lcore_id);
++}
++*/
++
++static bool
++check_pcap(struct file_cache *fc)
++{
++	uint32_t *magic;
++
++	magic = (uint32_t *)fc->fcache;
++	if (*magic != 0xa1b2c3d4) {
++		fprintf(stderr, "Magic number not match %x:%x\n",
++			*magic, 0xa1b2c3d4);
++		return (false);
++	}
++
++	memcpy(&fc->hdr, fc->fcache + fc->offset, sizeof(fc->hdr));
++	fc->offset += sizeof(fc->hdr);
++
++	if (fc->offset > fc->size) {
++		fprintf(stderr, "Pcap file header is bigger than file size\n");
++		return (false);
++	}
++
++	return (true);
++}
++
++static void
++init_trace_file_cache(const char *tracefilelist)
++{
++	FILE *fp;
++	char tracefilename[MAXPATHLEN];
++	int rr = -1; /* Make sure rr begins from 0 */
++
++	fp = fopen(tracefilelist, "r");
++	if (fp == NULL) {
++		fprintf(stderr, "Failed to open %s: %s\n",
++			tracefilelist, strerror(errno));
++		exit(EXIT_FAILURE);
++	}
++
++	while (fgets(tracefilename, MAXPATHLEN, fp) != NULL) {
++		struct file_cache *fc;
++		int64_t size; /* XXX 'int' will overflow for 3GB files. */
++		tracefilename[strlen(tracefilename)-1] = '\0'; /* strip '\n' */
++		int fd = open(tracefilename, O_RDONLY);
++		if (fd == -1) {
++			fprintf(stderr, "Failed to open %s: %s\n",
++				tracefilename, strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++
++		size = lseek(fd, 0, SEEK_END);
++		if (size == -1) {
++			fprintf(stderr, "Failed to seek to end %s: %s\n",
++				tracefilename, strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++		if (lseek(fd, 0, SEEK_SET) == -1) {
++			fprintf(stderr, "Failed to seek to 0 %s: %s\n",
++				tracefilename, strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++
++		fc = malloc(sizeof(*fc));
++		if (fc == NULL) {
++			fprintf(stderr, "Failed to malloc filecache: %s\n",
++				strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++
++		strcpy(fc->filename, tracefilename);
++
++		fc->offset = 0;
++		fc->size = size;
++
++		fc->fcache = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
++		if (fc->fcache == MAP_FAILED) {
++			fprintf(stderr, "Failed to mmap %s: %s\n",
++				tracefilename, strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++
++		do {
++			rr = (rr + 1) % RTE_MAX_LCORE;
++		} while (!((1ULL << rr) & cores_mask));
++
++		fc->next = lcore_file_cache[rr];
++		lcore_file_cache[rr] = fc;
++
++		printf("Load tracefile: %s done, which assigned to Lcore %d\n",
++		       tracefilename, rr);
++
++		if (!check_pcap(fc)) {
++			fprintf(stderr, "Check pcap failed: %s\n",
++				tracefilename);
++			exit(EXIT_FAILURE);
++		}
++
++		close(fd);
++	}
++
++	fclose(fp);
++}
++
++static void
++parse_config_file(const char *filename)
++{
++	FILE *fp;
++	char buf[BUFSIZ];
++	int i;
++
++	if (access(filename, R_OK) == -1) {
++		fprintf(stderr, "Failed to read from file %s: %s\n",
++			filename, strerror(errno));
++		exit(EXIT_FAILURE);
++	}
++
++	fp = fopen(filename, "r");
++	if (fp == NULL) {
++		fprintf(stderr," Failed to open %s: %s\n", filename,
++			strerror(errno));
++		exit(EXIT_FAILURE);
++	}
++
++	while (fgets(buf, BUFSIZ, fp) != NULL) {
++		int core_id, port_id, queue_id;
++		int ret;
++
++		char *p = strchr(buf, '#');
++		if (p != NULL)
++			*p = '\0';
++#ifdef DEBUG_CONFIG_FILE
++		printf("------------------------------\n");
++		printf("parsed line: %s\n", buf);
++#endif
++		ret = sscanf(buf, "core_id=%d,port_id=%d,queue_id=%d",
++			     &core_id, &port_id, &queue_id);
++		if (ret != 3)
++			continue;
++#ifdef DEBUG_CONFIG_FILE
++		printf("core_id = %d, port_id = %d, queue_id = %d\n",
++			core_id, port_id, queue_id);
++#endif
++		cores_conf[nb_cores_conf].core_id  = core_id;
++		cores_conf[nb_cores_conf].port_id  = port_id;
++		cores_conf[nb_cores_conf].queue_id = queue_id;
++
++		nb_cores_conf++;
++	}
++
++	/* Parse cores and queues configuration */
++	for (i = 0; i < nb_cores_conf; i++) {
++		uint8_t core_id  = cores_conf[i].core_id;
++		uint8_t port_id  = cores_conf[i].port_id;
++		uint8_t queue_id = cores_conf[i].queue_id;
++
++		cores_mask |= (1 << core_id);
++		ports_mask |= (1 << port_id);
++		queues_masks[port_id] |= (1 << queue_id);
++	}
++}
++
++static void
++dump_args(void)
++{
++	int i;
++
++	putchar('\n');
++	for (i = 0; i < 80; i++) putchar('#');
++	putchar('\n');
++
++
++	printf("burst size    : %d\n", opt_burst_size);
++	printf("packet size   : %d\n", opt_pkt_size);
++
++	if (func == RX)
++		printf("function      : %s\n", "RX");
++	else
++		printf("function      : %s (%s)\n", "TX",
++		       (build_packet == build_tcp_packet) ? "TCP" : "UDP");
++
++	/*
++	 * Dump configurations.
++	 */
++	printf("nb_cores_conf : %d\n", nb_cores_conf);
++	printf("cores_conf    :");
++
++	for (i = 0; i < nb_cores_conf; i++) {
++		printf("%s{ .core_id = %d, .port_id = %d, .queue_id = %d }%s\n",
++		       i == 0 ? " " : "                ",
++		       cores_conf[i].core_id,
++		       cores_conf[i].port_id,
++		       cores_conf[i].queue_id,
++		       i != nb_cores_conf - 1 ? "," : " }");
++	}
++
++	for (i = 0; i < 80; i++) putchar('#');
++	putchar('\n');
++	putchar('\n');
++}
++
++static void
++sanity_check(void)
++{
++	bool failed = false;
++
++	if (nb_cores_conf == 0) {
++		fprintf(stderr, "Cores configuration file must be specified"
++			" by '-c config'.\n");
++		failed = true;
++	}
++
++	if (failed)
++		exit(EXIT_FAILURE);
++}
++
++/* Parse the arguments given in the command line of the application */
++static void
++parse_args(int argc, char **argv)
++{
++	int opt;
++	const char *prgname = argv[0];
++
++	/* Disable printing messages within getopt() */
++	opterr = 0;
++
++	/* Parse command line */
++	while ((opt = getopt(argc, argv, "n:f:t:p:b:l:i:c:h")) != -1) {
++		switch (opt) {
++		case 'n':
++			sscanf(optarg, "%d", &opt_pkt_nb);
++			npkt_limit = (opt_pkt_nb > 0);
++			break;
++		case 'f':
++			if (strcmp(optarg, "tx") == 0)
++				func = TX;
++			else if (strcmp(optarg, "rx") == 0)
++				func = RX;
++			else {
++				print_usage(prgname);
++				FATAL_ERROR("Invalid option for -f specified");
++			}
++			break;
++
++		case 't':
++			build_packet = build_tcp_packet;
++			strcpy(tracefilelist, optarg);
++
++			/*
++			 * Assign trace file to cpu needs
++			 * cores be configured.
++			 */
++			if (nb_cores_conf != 0)
++				init_trace_file_cache(tracefilelist);
++			break;
++
++		case 'p':
++			sscanf(optarg, "%d", &opt_pkt_size);
++			break;
++
++		case 'b':
++			sscanf(optarg, "%d", &opt_burst_size);
++			break;
++
++		case 'l':
++			sscanf(optarg, "%d", &opt_loop_count);
++			break;
++
++		case 'i':
++			sscanf(optarg, "%d", &opt_interval);
++			break;
++
++		case 'c':
++			parse_config_file(optarg);
++			if (tracefilelist[0] != '\0')
++				init_trace_file_cache(tracefilelist);
++			break;
++		
++		case 'h':
++			print_usage(prgname);
++			exit(EXIT_SUCCESS);
++			break;
++
++		default:
++			print_usage(prgname);
++			FATAL_ERROR("Invalid option %s specified", optarg);
++		}
++	}
++
++	sanity_check();
++	dump_args();
++}
++
++/* Initialise a single port on an Ethernet device */
++static void
++init_port(uint8_t port, uint8_t nb_queues)
++{
++	int ret;
++	uint8_t queue;
++
++	/* Initialise device and RX/TX queues */
++	PRINT_INFO("Initialising port %u ...", (unsigned)port);
++	fflush(stdout);
++
++	ret = rte_eth_dev_configure(port, nb_queues, nb_queues, &port_conf);
++	if (ret < 0)
++		FATAL_ERROR("Could not configure port%u (%d)",
++		            (unsigned)port, ret);
++
++	for (queue = 0; queue < nb_queues; queue++) {
++		if (!((1ULL << queue) & queues_masks[port]))
++			FATAL_ERROR("Discrete queue configuration");
++
++		ret = rte_eth_rx_queue_setup(port, queue, NB_RXD,
++					     rte_eth_dev_socket_id(port),
++					     &rx_conf, pktmbuf_pool);
++		if (ret < 0)
++			FATAL_ERROR("Could not setup up RX queue for "
++				    "port%u queue%u (%d)",
++				    (unsigned)port, (unsigned)queue, ret);
++	}
++
++	for (queue = 0; queue < nb_queues; queue++) {
++		if (!((1ULL << queue) & queues_masks[port]))
++			FATAL_ERROR("Discrete queue configuration");
++
++		ret = rte_eth_tx_queue_setup(port, queue, NB_TXD,
++					     rte_eth_dev_socket_id(port),
++					     &tx_conf);
++		if (ret < 0)
++			FATAL_ERROR("Could not setup up TX queue for "
++				    "port%u queue%u (%d)",
++				    (unsigned)port, (unsigned)queue, ret);
++	}
++
++	ret = rte_eth_dev_start(port);
++	if (ret < 0)
++		FATAL_ERROR("Could not start port%u (%d)", (unsigned)port, ret);
++
++	rte_eth_promiscuous_enable(port);
++}
++
++/* Check the link status of all ports in up to 9s, and print them finally */
++static void
++check_all_ports_link_status(uint8_t port_num, uint32_t port_mask)
++{
++#define CHECK_INTERVAL 100 /* 100ms */
++#define MAX_CHECK_TIME 90 /* 9s (90 * 100ms) in total */
++	uint8_t portid, count, all_ports_up, print_flag = 0;
++	struct rte_eth_link link;
++
++	printf("\nChecking link status");
++	fflush(stdout);
++	for (count = 0; count <= MAX_CHECK_TIME; count++) {
++		all_ports_up = 1;
++		for (portid = 0; portid < port_num; portid++) {
++			if ((port_mask & (1 << portid)) == 0)
++				continue;
++			memset(&link, 0, sizeof(link));
++			rte_eth_link_get_nowait(portid, &link);
++			/* print link status if flag set */
++			if (print_flag == 1) {
++				if (link.link_status)
++					printf("Port %d Link Up - speed %u "
++						"Mbps - %s\n", (uint8_t)portid,
++						(unsigned)link.link_speed,
++				(link.link_duplex == ETH_LINK_FULL_DUPLEX) ?
++					("full-duplex") : ("half-duplex\n"));
++				else
++					printf("Port %d Link Down\n",
++						(uint8_t)portid);
++				continue;
++			}
++			/* clear all_ports_up flag if any link down */
++			if (link.link_status == 0) {
++				all_ports_up = 0;
++				break;
++			}
++		}
++		/* after finally printing all link status, get out */
++		if (print_flag == 1)
++			break;
++
++		if (all_ports_up == 0) {
++			printf(".");
++			fflush(stdout);
++			rte_delay_ms(CHECK_INTERVAL);
++		}
++
++		/* set the print_flag if all ports up or timeout */
++		if (all_ports_up == 1 || count == (MAX_CHECK_TIME - 1)) {
++			print_flag = 1;
++			printf("done\n");
++		}
++	}
++}
++
++#include "alignpool.h"
++/* Initialise ports/queues etc. and start main loop on each core */
++int
++main(int argc, char *argv[])
++{
++	int ret;
++	int i;
++	uint8_t nb_sys_ports, nb_queues;
++	uint8_t port;
++	uint8_t bit;
++
++	/* Associate signal_hanlder function with USR signals */
++	signal(SIGUSR1, signal_handler);
++	signal(SIGUSR2, signal_handler);
++	signal(SIGINT, signal_handler);
++
++	/* Initialise EAL */
++	ret = rte_eal_init(argc, argv);
++	if (ret < 0)
++		FATAL_ERROR("Could not initialise EAL (%d)", ret);
++	argc -= ret;
++	argv += ret;
++
++	/* Parse application arguments (after the EAL ones) */
++	parse_args(argc, argv);
++
++	/* Create the mbuf pool */
++	pktmbuf_pool = rte_mempool_create("mbuf_pool", NB_MBUF, MBUF_SZ,
++			MEMPOOL_CACHE_SZ,
++			sizeof(struct rte_pktmbuf_pool_private),
++			rte_pktmbuf_pool_init, NULL, rte_pktmbuf_init, NULL,
++			rte_socket_id(), 0);
++	/*
++	pktmbuf_pool = my_get_aligned_mempool("mbuf_pool", NB_MBUF, MEMPOOL_CACHE_SZ,
++			sizeof(struct rte_pktmbuf_pool_private),
++			rte_pktmbuf_pool_init, NULL, rte_pktmbuf_init, NULL,
++			rte_socket_id(), RTE_MEMZONE_2MB);
++			*/
++	if (pktmbuf_pool == NULL) {
++		FATAL_ERROR("Could not initialise mbuf pool");
++		return (-1);
++	}
++	rte_mempool_dump(stdout, pktmbuf_pool);
++
++	/* Get number of ports found in scan */
++	nb_sys_ports = rte_eth_dev_count();
++	if (nb_sys_ports == 0)
++		FATAL_ERROR("No supported Ethernet devices found - check that "
++		            "CONFIG_RTE_LIBRTE_IGB_PMD=y and/or "
++		            "CONFIG_RTE_LIBRTE_IXGBE_PMD=y in the config file");
++	printf("number of ports: %d\n", nb_sys_ports);
++
++	/* Initialise each port */
++	for (port = 0; port < nb_sys_ports; port++) {
++		/* Skip ports that are not enabled */
++		if ((ports_mask & (1 << port)) == 0) {
++			continue;
++		}
++
++		nb_queues = 0;
++		for (bit = 0; bit < 8*sizeof(uint64_t); bit++)
++			nb_queues += ((queues_masks[port] >> bit) & 1);
++		printf("number of queues enabled for port%u: %d\n",
++			port, nb_queues);
++
++		init_port(port, nb_queues);
++	}
++	check_all_ports_link_status(nb_sys_ports, ports_mask);
++
++	/* Launch per-lcore function on every lcore */
++	rte_eal_mp_remote_launch(main_loop, NULL, CALL_MASTER);
++	RTE_LCORE_FOREACH_SLAVE(i) {
++		if (rte_eal_wait_lcore(i) < 0)
++			return (-1);
++	}
++
++	print_stats();
++
++	return (1);
++}
++
+diff --git a/examples/pktgen/Makefile b/examples/pktgen/Makefile
+new file mode 100644
+index 0000000..19ceb71
+--- /dev/null
++++ b/examples/pktgen/Makefile
+@@ -0,0 +1,50 @@
++#   BSD LICENSE
++# 
++#   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
++#   All rights reserved.
++# 
++#   Redistribution and use in source and binary forms, with or without
++#   modification, are permitted provided that the following conditions
++#   are met:
++# 
++#     * Redistributions of source code must retain the above copyright
++#       notice, this list of conditions and the following disclaimer.
++#     * Redistributions in binary form must reproduce the above copyright
++#       notice, this list of conditions and the following disclaimer in
++#       the documentation and/or other materials provided with the
++#       distribution.
++#     * Neither the name of Intel Corporation nor the names of its
++#       contributors may be used to endorse or promote products derived
++#       from this software without specific prior written permission.
++# 
++#   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++#   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++#   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++#   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++#   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++#   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++#   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++#   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++#   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++#   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++#   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++ifeq ($(RTE_SDK),)
++$(error "Please define RTE_SDK environment variable")
++endif
++
++# Default target, can be overriden by command line or environment
++RTE_TARGET ?= x86_64-native-linuxapp-gcc
++
++include $(RTE_SDK)/mk/rte.vars.mk
++
++# binary name
++APP = pktgen
++
++# all source are stored in SRCS-y
++SRCS-y := main.c mbuf.c
++
++CFLAGS += -O3
++CFLAGS += $(WERROR_FLAGS)
++
++include $(RTE_SDK)/mk/rte.extapp.mk
+diff --git a/examples/pktgen/README.md b/examples/pktgen/README.md
+new file mode 100644
+index 0000000..31b00df
+--- /dev/null
++++ b/examples/pktgen/README.md
+@@ -0,0 +1,95 @@
++
++Usage
++=====
++
++Build and run this application
++
++	make RTE_SDK=/path/to/dpdk-sdk RTE_TARGET=build
++	sudo ./build/pktgen -c fff -n 4 -- -c config -b 1 -f tx              # Send udp packet
++	sudo ./build/pktgen -c fff -n 4 -- -c config -b 1 -f tx -t tracelist # Send tcp packet from pcap file.
++	sudo ./build/pktfen -c fff -n 4 -- -c config -b 1 -f rx
++
++
++TODO
++====
++
++- Add sanity_check() after parse_args()
++    -c and -f tx
++    -l and -f tx
++
++- Add a description of the correctness of send logic.
++  (order and no drop)
++
++- Add -c count (Hard to implement to keep code clean and high performance)
++
++- Understand RSS.
++- Understand memory channel.
++
++
++ChangeLog
++=========
++
++- Add '-t trace list file' option to specify the pcap file to be sent.
++
++- Add '-p packet size' (udp packet length) option
++
++- Add '-b burst size' option
++
++- Add '-l loop count' option to provide the method to slow tx speed down.
++
++- Correct the calculation of sent and received bytes.
++
++- Add '-i interval' option to specify the interval of updating stats.
++
++- Add sanity_check() which will be called after parse_args() to check the
++  correctness of arguments specified through the command line.
++
++- Add -c option to setup the cores configuration by reading
++  from configuration file. Configuration file format likes this:
++
++    #
++    # There are six cores and two ports are used.
++    # And there are three queues are enabled for each port.
++    #
++
++    # Settings for NIC-0
++    core_id=0,port_id=0,queue_id=0 # Cpu0 manages the queue 0 of NIC-0
++    core_id=1,port_id=0,queue_id=1
++    core_id=2,port_id=0,queue_id=2
++
++    # Settings for NIC-1
++    core_id=3,port_id=1,queue_id=0
++    core_id=4,port_id=1,queue_id=1
++    core_id=5,port_id=1,queue_id=2
++
++  Empty line and comments (Anything after #) are supported.
++
++
++NOTICE
++======
++
++To replay tcp, all packets in pcap should be sent in order correctly,
++so, pcap files should be sent in correct order.
++
++
++All enjoyable things
++====================
++
++1. The high speed of sending and receiving packets;
++2. The correctness of each number (number of packets and bytes);
++3. The human friendly information and statistics;
++
++
++The experience can be got
++=========================
++
++1. Maybe only a few codes, then a wonderful function will be got.
++2. Make a excellent framework, then everything can benefit from it
++   easily and naturally.
++
++PS. I love to write codes.
++
++
++Elegant source code (code architecture and effeciency), handy command
++line argments and outputs -- Wonderful using experience.
++
+diff --git a/examples/pktgen/alignpool.c b/examples/pktgen/alignpool.c
+new file mode 100644
+index 0000000..94d3b39
+--- /dev/null
++++ b/examples/pktgen/alignpool.c
+@@ -0,0 +1,75 @@
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <stdint.h>
++#include <errno.h>
++#include <sys/queue.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++
++#include <rte_memory.h>
++#include <rte_memzone.h>
++#include <rte_mempool.h>
++#include <rte_launch.h>
++#include <rte_eal.h>
++#include <rte_errno.h>
++#include <rte_per_lcore.h>
++#include <rte_lcore.h>
++#include <rte_debug.h>
++
++#include "alignpool.h"
++
++/* The objsize is 4096, and all objs aligned to 4096 */
++#define OBJSIZE 4096
++struct rte_mempool *
++my_get_aligned_mempool(const char *name, unsigned n,
++		unsigned cache_size, unsigned private_data_size,
++		rte_mempool_ctor_t *mp_init, void *mp_init_arg,
++		rte_mempool_obj_ctor_t *obj_init, void *obj_init_arg,
++		int socket_id, unsigned flags)
++	/* TODO remove flags */
++{
++	char mz_name[RTE_MEMZONE_NAMESIZE];
++	const struct rte_memzone *mz;
++	struct rte_mempool *mp;
++	unsigned elt_size;
++	unsigned long long addr[2];
++	phys_addr_t *pa;
++	int hc_fd;
++	int ret;
++
++	snprintf(mz_name, RTE_MEMZONE_NAMESIZE, "%s%s", "myzone_", name);
++	mz = rte_memzone_reserve_aligned(mz_name, n*OBJSIZE, socket_id, flags, OBJSIZE);
++	if (mz == NULL) {
++		return NULL;
++	}
++	if (likely((pa = calloc(1, sizeof(*pa))) != NULL)) {
++		*pa = mz->phys_addr;
++	} else {
++		return NULL;
++	}
++	hc_fd = open("/dev/kvm-hypercall", 0);
++	if (hc_fd < 0) {
++		perror("open kvm-hypercall");
++		return NULL;
++	}
++	addr[0] = mz->phys_addr;
++	addr[1] = mz->len;
++	ret = ioctl(hc_fd, 0, addr);
++	fprintf(stderr, "sleep 5 seconds\n");
++	sleep(5);
++	// sleep wait for ioctl to complete.
++	fprintf(stderr, "hc_fd: %d\n", ret);
++#ifdef RTE_LIBRTE_MEMPOOL_DEBUG
++	elt_size = OBJSIZE - 64 - 64;
++#else
++	elt_size = OBJSIZE - 64;
++#endif
++	mp = rte_mempool_xmem_create(name, n, elt_size, cache_size,
++			private_data_size, mp_init, mp_init_arg, obj_init,
++			obj_init_arg, socket_id, MEMPOOL_F_NO_SPREAD,
++			(void *)mz->addr, pa, 1, 64-1);
++	return mp;
++}
+diff --git a/examples/pktgen/alignpool.h b/examples/pktgen/alignpool.h
+new file mode 100644
+index 0000000..ec31f0d
+--- /dev/null
++++ b/examples/pktgen/alignpool.h
+@@ -0,0 +1,11 @@
++#ifndef _ALIGNPOOL_H_
++#define _ALIGNPOOL_H_
++
++struct rte_mempool *
++my_get_aligned_mempool(const char *name, unsigned n,
++		unsigned cache_size, unsigned private_data_size,
++		rte_mempool_ctor_t *mp_init, void *mp_init_arg,
++		rte_mempool_obj_ctor_t *obj_init, void *obj_init_arg,
++		int socket_id, unsigned flags);
++
++#endif
+diff --git a/examples/pktgen/auto b/examples/pktgen/auto
+new file mode 100755
+index 0000000..2206178
+--- /dev/null
++++ b/examples/pktgen/auto
+@@ -0,0 +1,63 @@
++#!/bin/bash
++#export EXTRA_CFLAGS="-O0 -g"
++load_igb_uio_module()
++{
++        if [ ! -f $RTE_SDK/$RTE_TARGET/kmod/igb_uio.ko ];then
++                echo "## ERROR: Target does not have the DPDK UIO Kernel Module."
++                echo "       To fix, please try to rebuild target."
++                return
++        fi
++
++        /sbin/lsmod | grep -s uio > /dev/null
++        if [ $? -ne 0 ] ; then
++                modinfo uio > /dev/null
++                if [ $? -eq 0 ]; then
++                        echo "Loading uio module"
++                        sudo /sbin/modprobe uio
++                fi
++        fi
++
++        # UIO may be compiled into kernel, so it may not be an error if it can't
++        # be loaded.
++
++        echo "Loading DPDK UIO module"
++        sudo /sbin/insmod $RTE_SDK/$RTE_TARGET/kmod/igb_uio.ko
++        if [ $? -ne 0 ] ; then
++                echo "## ERROR: Could not load kmod/igb_uio.ko."
++                quit
++        fi
++}
++
++/sbin/lsmod | grep igb_uio > /dev/null
++if [ $? != 0 ]; then
++	load_igb_uio_module
++fi
++
++ls /dev/tlb_ctl >/dev/null 2>&1
++if [ $? != 0 ]; then
++	sudo /sbin/insmod $RTE_SDK/build/kmod/tlb_ctl.ko
++fi
++
++cd $RTE_SDK/tools
++sudo ./dpdk_nic_bind.py -b igb_uio 00:04.0
++#sudo ./dpdk_nic_bind.py -b igb_uio 00:05.0
++#sudo ./dpdk_nic_bind.py -b igb_uio 00:06.0
++#sudo ./dpdk_nic_bind.py -b igb_uio 00:07.0
++if [ -c /dev/kvm-hypercall ]; then
++	echo ""
++else
++	sudo insmod $RTE_SDK/build/kmod/hypercall.ko
++fi
++cd $RTE_SDK/$RTE_TARGET
++make -j 8
++if [ $? != 0 ]; then
++	echo "make failed"
++	exit 1
++fi
++cd $RTE_SDK/examples/pktgen
++make clean
++make
++if [ $? != 0 ]; then
++	exit 1
++fi
++sudo ./build/pktgen -c 1 -n 4 -- -c config -f tx -b 32 -i 30000 -p 60 # -n 256
+diff --git a/examples/pktgen/config b/examples/pktgen/config
+new file mode 100644
+index 0000000..8b4a675
+--- /dev/null
++++ b/examples/pktgen/config
+@@ -0,0 +1,21 @@
++
++#
++# There are six cores and two ports are used.
++# And there are three queues are enabled for each port.
++#
++
++# Settings for NIC-0
++core_id=0,port_id=0,queue_id=0 # Cpu0 manages the queue 0 of NIC-0
++#core_id=1,port_id=1,queue_id=0
++#core_id=2,port_id=2,queue_id=0
++#core_id=3,port_id=3,queue_id=0
++#core_id=4,port_id=0,queue_id=4 # Cpu0 manages the queue 0 of NIC-0
++#core_id=5,port_id=0,queue_id=5
++#core_id=6,port_id=0,queue_id=6
++#core_id=7,port_id=0,queue_id=7
++
++# Settings for NIC-1
++#core_id=3,port_id=1,queue_id=0
++#core_id=4,port_id=1,queue_id=1
++#core_id=5,port_id=1,queue_id=2
++
+diff --git a/examples/pktgen/main.c b/examples/pktgen/main.c
+new file mode 100644
+index 0000000..60b56af
+--- /dev/null
++++ b/examples/pktgen/main.c
+@@ -0,0 +1,1394 @@
++/*-
++ *   BSD LICENSE
++ *
++ *   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
++ *   All rights reserved.
++ *   Copyright(c) 2014-2015 Tiwei Bie (btw@FreeBSD.org). All rights reserved.
++ *   All rights reserved.
++ *
++ *   Redistribution and use in source and binary forms, with or without
++ *   modification, are permitted provided that the following conditions
++ *   are met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *       notice, this list of conditions and the following disclaimer in
++ *       the documentation and/or other materials provided with the
++ *       distribution.
++ *     * Neither the name of Intel Corporation nor the names of its
++ *       contributors may be used to endorse or promote products derived
++ *       from this software without specific prior written permission.
++ *
++ *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <unistd.h>
++#include <inttypes.h>
++#include <string.h>
++#include <sys/queue.h>
++#include <stdarg.h>
++#include <errno.h>
++#include <getopt.h>
++#include <assert.h>
++
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <signal.h>
++#include <sys/time.h>
++#include <sys/param.h>
++#include <sys/mman.h>
++
++#include <pcap/pcap.h>
++
++#include <rte_common.h>
++#include <rte_log.h>
++#include <rte_memory.h>
++#include <rte_memcpy.h>
++#include <rte_memzone.h>
++#include <rte_tailq.h>
++#include <rte_eal.h>
++#include <rte_per_lcore.h>
++#include <rte_launch.h>
++#include <rte_atomic.h>
++#include <rte_lcore.h>
++#include <rte_branch_prediction.h>
++#include <rte_interrupts.h>
++#include <rte_pci.h>
++#include <rte_debug.h>
++#include <rte_ether.h>
++#include <rte_ethdev.h>
++#include <rte_ring.h>
++#include <rte_log.h>
++#include <rte_mempool.h>
++#include <rte_mbuf.h>
++#include <rte_string_fns.h>
++#include <rte_cycles.h>
++
++//#define DEBUG_CONFIG_FILE
++
++#define ADDRDBG 0
++
++static bool build_udp_packet(char *buf, int *pkt_size, uint64_t *seed);
++static bool build_tcp_packet(char *buf, int *pkt_size,
++		 __attribute__((unused)) uint64_t *seed);
++
++#ifndef __FAVOR_BSD
++#define __FAVOR_BSD /* For uh_ prefix in struct udphdr */
++#endif
++//#include <net/ethernet.h> /* conflict with rte_ether.h */
++#include <netinet/in.h>
++#include <netinet/ip.h>
++#include <netinet/udp.h>
++
++/* Macros for printing using RTE_LOG */
++#define RTE_LOGTYPE_APP RTE_LOGTYPE_USER1
++#define FATAL_ERROR(fmt, args...)       rte_exit(EXIT_FAILURE, fmt "\n", ##args)
++#define PRINT_INFO(fmt, args...)        RTE_LOG(INFO, APP, fmt "\n", ##args)
++
++/* Max ports that can be used (each port is associated with at least one lcore) */
++#define MAX_PORTS               RTE_MAX_LCORE
++
++/* Max queues that can be used (each queue is associated with exactly one lcore) */
++#define MAX_QUEUES		16
++
++/* Max size of a single packet */
++#define MAX_PACKET_SZ           2048
++
++/* Number of bytes needed for each mbuf */
++#define MBUF_SZ \
++	(MAX_PACKET_SZ + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
++
++/* Number of mbufs in mempool that is created */
++#define NB_MBUF                 8192
++
++/* How many packets to attempt to read from NIC in one go */
++#define PKT_BURST_SZ            32
++
++/* How many objects (mbufs) to keep in per-lcore mempool cache */
++#define MEMPOOL_CACHE_SZ        PKT_BURST_SZ
++
++/* Number of RX ring descriptors */
++//#define NB_RXD                  128
++#define NB_RXD                  256
++
++/* Number of TX ring descriptors */
++//#define NB_TXD                  512
++#define NB_TXD                  256
++
++/*
++ * RX and TX Prefetch, Host, and Write-back threshold values should be
++ * carefully set for optimal performance. Consult the network
++ * controller's datasheet and supporting DPDK documentation for guidance
++ * on how these parameters should be set.
++ */
++/* RX ring configuration */
++static const struct rte_eth_rxconf rx_conf = {
++	.rx_thresh = {
++		.pthresh = 8,   /* Ring prefetch threshold */
++		.hthresh = 8,   /* Ring host threshold */
++		.wthresh = 4,   /* Ring writeback threshold */
++	},
++	.rx_free_thresh = 0,    /* Immediately free RX descriptors */
++};
++
++/*
++ * These default values are optimized for use with the Intel(R) 82599 10 GbE
++ * Controller and the DPDK ixgbe PMD. Consider using other values for other
++ * network controllers and/or network drivers.
++ */
++/* TX ring configuration */
++static const struct rte_eth_txconf tx_conf = {
++	.tx_thresh = {
++		.pthresh = 36,  /* Ring prefetch threshold */
++		.hthresh = 0,   /* Ring host threshold */
++		.wthresh = 0,   /* Ring writeback threshold */
++	},
++	.tx_free_thresh = 0,    /* Use PMD default values */
++	.tx_rs_thresh = 0,      /* Use PMD default values */
++	.txq_flags = ETH_TXQ_FLAGS_NOXSUMS,
++};
++
++/* Options for configuring ethernet port */
++static const struct rte_eth_conf port_conf = {
++	.rxmode = {
++		.mq_mode = ETH_MQ_RX_RSS,
++		.max_rx_pkt_len = ETHER_MAX_LEN,
++		.header_split   = 0,   /* Header Split disabled */
++		.hw_ip_checksum = 0,   /* IP checksum offload disabled */
++		.hw_vlan_filter = 0,   /* VLAN filtering disabled */
++		.jumbo_frame    = 0,   /* Jumbo Frame Support disabled */
++		.hw_strip_crc   = 0,   /* CRC stripped by hardware */
++	},
++	.rx_adv_conf = {
++		.rss_conf = {
++			.rss_key = NULL,
++			.rss_hf = ETH_RSS_IPV4,
++		},
++	},
++	.txmode = {
++		.mq_mode = ETH_MQ_TX_NONE,
++	},
++};
++
++/* Mempool for mbufs */
++static struct rte_mempool *pktmbuf_pool = NULL;
++
++static uint64_t cores_mask = 0;
++static uint64_t ports_mask = 0;
++static uint64_t queues_masks[MAX_PORTS] = { 0 };
++
++struct core_conf {
++	uint8_t core_id;
++	uint8_t port_id;
++	uint8_t queue_id;
++};
++
++/* Array storing port_id and queue_id that are associated with each lcore */
++static struct core_conf cores_conf[MAX_PORTS * MAX_QUEUES];
++static int nb_cores_conf = 0;
++
++#define ARRAY_SIZE(array) (sizeof(array)/sizeof(array[0]))
++
++/* Structure type for recording lcore-specific stats */
++struct stats {
++	uint64_t rx_pkts;
++	uint64_t rx_bytes;
++
++	uint64_t tx_pkts;
++	uint64_t tx_bytes;
++
++	uint64_t tx_total_pkts;
++	uint64_t tx_total_bytes;
++
++	uint64_t rx_total_pkts;
++	uint64_t rx_total_bytes;
++} __attribute__((aligned(64)));;
++
++/* Array of lcore-specific stats */
++static struct stats lcore_stats[RTE_MAX_LCORE];
++static short port_ids[RTE_MAX_LCORE];
++static short queue_ids[RTE_MAX_LCORE];
++
++static enum {
++	TX = 0,
++	RX
++} func;
++
++static struct timeval last_time[RTE_MAX_LCORE] __attribute__((aligned(64)));
++
++static bool npkt_limit = false;
++
++static int32_t opt_pkt_nb     = 0;
++static int32_t opt_pkt_size   = 60;
++static int32_t opt_burst_size = 3;
++static int32_t opt_loop_count = 0;
++static int32_t opt_interval   = 3000000;
++
++typedef bool (*build_packet_t)(char *buf, int *pkt_size, uint64_t *seed);
++static build_packet_t build_packet = build_udp_packet;
++
++struct file_cache {
++	char filename[MAXPATHLEN];
++	char *fcache;
++	uint64_t offset;
++	uint64_t size;
++	struct pcap_file_header hdr;
++	struct file_cache *next;
++} __attribute__((aligned(64)));;
++
++struct file_cache *lcore_file_cache[RTE_MAX_LCORE] = { NULL };
++static char tracefilelist[MAXPATHLEN] = { 0 };
++
++#define MAX_PKT_LEN	(1512 + 4)
++
++static void __rte_unused
++dump_mempool(int num)
++{
++	int i, k;
++	for (k = 0; k < num; k++)
++		for (i = 0; i < 4096; i+=32) {
++			int j;
++			printf("%04x: ", i);
++			for (j = 0; j < 32; j ++) {
++				if (j == 8)
++					printf(" ");
++				printf("%02x ", ((unsigned char *)(pktmbuf_pool->elt_va_start))[k*4096 + i+j]);
++			}
++			printf("\n");
++		}
++}
++static void __rte_unused
++dump_mempool_addr(uint64_t addr)
++{
++	int i, j;
++	for (i = 0; i < 4096; i += 32) {
++		printf("%04x:", i);
++		for (j = 0; j < 32; j++) {
++			if (j%8 == 0)
++				printf(" ");
++			printf("%02x ", (((unsigned char *)addr)[i+j]));
++		}
++		printf("\n");
++	}
++}
++
++/* Print out statistics on packets handled */
++static void
++print_stats(void)
++{
++	unsigned i;
++	uint64_t total_pkts = 0;
++	uint64_t total_bytes = 0;
++
++	if (func == RX) {
++		printf("\n**Pktgen statistics**\n"
++		       "=======  ======  ======= ============  ==============\n"
++		       " Lcore    Port    Queue   RX Packets        RX Bytes \n"
++		       "-------  ------  ------- ------------  --------------\n");
++		RTE_LCORE_FOREACH(i) {
++			if (!((1ULL << i) & cores_mask)) {
++				printf("%6u %7c %8c %12c %15c\n",
++				       i, '-', '-', '-', '-');
++				continue;
++			}
++			lcore_stats[i].rx_total_pkts  += lcore_stats[i].rx_pkts;
++			lcore_stats[i].rx_total_bytes += lcore_stats[i].rx_bytes;
++
++			printf("%6u %7d %8d %12"PRIu64" %15"PRIu64"\n",
++			       i, port_ids[i], queue_ids[i],
++			       lcore_stats[i].rx_total_pkts,
++			       lcore_stats[i].rx_total_bytes);
++
++			total_pkts  += lcore_stats[i].rx_total_pkts;
++			total_bytes += lcore_stats[i].rx_total_bytes;
++		}
++	} else {
++		printf("\n**Pktgen statistics**\n"
++		       "=======  ======  ======= ============  ==============\n"
++		       " Lcore    Port    Queue   TX Packets        TX Bytes \n"
++		       "-------  ------  ------- ------------  --------------\n");
++		RTE_LCORE_FOREACH(i) {
++			if (!((1ULL << i) & cores_mask)) {
++				printf("%6u %7c %8c %12c %15c\n",
++				       i, '-', '-', '-', '-');
++				continue;
++			}
++			lcore_stats[i].tx_total_pkts  += lcore_stats[i].tx_pkts;
++			lcore_stats[i].tx_total_bytes += lcore_stats[i].tx_bytes;
++
++			printf("%6u %7d %8d %12"PRIu64" %15"PRIu64"\n",
++			       i, port_ids[i], queue_ids[i],
++			       lcore_stats[i].tx_total_pkts,
++			       lcore_stats[i].tx_total_bytes);
++
++			total_pkts  += lcore_stats[i].tx_total_pkts;
++			total_bytes += lcore_stats[i].tx_total_bytes;
++		}
++	}
++	printf("%6s %7c %8c %12"PRIu64" %15"PRIu64"\n", "Total",
++	       '-', '-', total_pkts, total_bytes);
++	printf("=======  ======  ======= ============  ==============\n");
++}
++
++static void
++update_rx_stats(int count)
++{
++	unsigned int lcore_id = rte_lcore_id();
++	struct timeval tv;
++	double sec_diff;
++	double bps, pps;
++	uint64_t rx_pkts = lcore_stats[lcore_id].rx_pkts;
++	uint64_t rx_bytes = lcore_stats[lcore_id].rx_bytes;
++
++	gettimeofday(&tv, NULL);
++
++	sec_diff  = tv.tv_sec  - last_time[lcore_id].tv_sec;
++	sec_diff += (tv.tv_usec - last_time[lcore_id].tv_usec) / 1000000.0;
++	assert(sec_diff != 0);
++
++	/*
++	 * Raw packets have 4 bytes crc + 20 bytes framing, this is
++	 * where '+ rx_pkts * 24' comes from. Note, This is only used
++	 * to calculate the transmit speed. And it is not counted into
++	 * the total bytes in final statistics in print_stats(), which
++	 * only contains the total bytes of ether header, ip header,
++	 * tcp/udp header, and payload.
++	 */
++	pps = rx_pkts / sec_diff;
++	bps = ((rx_bytes + rx_pkts * 24) * 8.0) / sec_diff;
++
++	printf("Lcore %2u: %2.3f Mpps, %3.3f Gbps "
++		"(%ld packets per chunk) in %6.4f sec\n",
++		lcore_id, pps / 1000000.0, bps / 1000000000.0,
++		lcore_stats[lcore_id].rx_pkts / count, sec_diff);
++
++	last_time[lcore_id] = tv;
++}
++
++static void
++update_tx_stats(int count)
++{
++	unsigned int lcore_id = rte_lcore_id();
++	struct timeval tv;
++	double sec_diff;
++	double bps, pps;
++	uint64_t tx_pkts = lcore_stats[lcore_id].tx_pkts;
++	uint64_t tx_bytes = lcore_stats[lcore_id].tx_bytes;
++
++	gettimeofday(&tv, NULL);
++
++	sec_diff  = tv.tv_sec  - last_time[lcore_id].tv_sec;
++	sec_diff += (tv.tv_usec - last_time[lcore_id].tv_usec) / 1000000.0;
++	assert(sec_diff != 0);
++
++	/*
++	 * Raw packets have 4 bytes crc + 20 bytes framing, this is
++	 * where '+ tx_pkts * 24' comes from. Note, This is only used
++	 * to calculate the transmit speed. And it is not counted into
++	 * the total bytes in final statistics in print_stats(), which
++	 * only contains the total bytes of ether header, ip header,
++	 * tcp/udp header, and payload.
++	 */
++	pps = tx_pkts / sec_diff;
++	bps = ((tx_bytes + tx_pkts * 24) * 8.0) / sec_diff;
++
++	printf("Lcore %2u: %2.3f Mpps, %3.3f Gbps "
++		"(%ld packets per chunk) in %6.4f sec\n",
++		lcore_id, pps / 1000000.0, bps / 1000000000.0,
++		lcore_stats[lcore_id].tx_pkts / count, sec_diff);
++
++	last_time[lcore_id] = tv;
++}
++
++/* Custom handling of signals to handle stats */
++static void
++signal_handler(int signum)
++{
++	/* When we receive a USR1 signal, print stats */
++	if (signum == SIGUSR1) {
++		print_stats();
++	}
++
++	if (signum == SIGINT) {
++		print_stats();
++		exit(EXIT_SUCCESS);
++	}
++
++	/* When we receive a USR2 signal, reset stats */
++	if (signum == SIGUSR2) {
++		memset(&lcore_stats, 0, sizeof(lcore_stats));
++		printf("\n**Statistics have been reset**\n");
++		return;
++	}
++}
++
++static inline uint32_t
++myrand(uint64_t *seed)
++{
++	*seed = *seed * 1103515245 + 12345;
++	return (uint32_t)(*seed >> 32);
++}
++#if 0
++static void
++dump_packet(char *buf, int pkt_size)
++{
++	struct ether_hdr *eh = (struct ether_hdr *)buf;
++	struct ip *ip = (struct ip *)(eh + 1);
++	struct udphdr *udp = (struct udphdr *)(ip + 1);
++	char *payload = (char *)(udp + 1);
++
++	(void)pkt_size; // Check with ip->ip_len.
++
++	printf("---------------------------------------\n");
++
++#define TEST_INT(m) printf("%s: %d\n", #m, m)
++	TEST_INT(ip->ip_v);
++	TEST_INT(ip->ip_hl);
++	TEST_INT(ntohs(ip->ip_len));
++	TEST_INT(ip->ip_id);
++	TEST_INT(ip->ip_off);
++	TEST_INT(ip->ip_ttl);
++
++	printf("ip->ip_p: %s\n", ip->ip_p == IPPROTO_UDP ? "udp" :
++				(ip->ip_p == IPPROTO_TCP ? "tcp" : "unknown"));
++
++#define TEST_IP(m) printf("%s: %d.%d.%d.%d\n", #m, \
++		(m & 0xff000000) >> 24, (m & 0x00ff0000) >> 16, \
++		(m & 0x0000ff00) >>  8, (m & 0x000000ff) >>  0);
++
++	TEST_IP(ntohl(ip->ip_dst.s_addr));
++	TEST_IP(ntohl(ip->ip_src.s_addr));
++	TEST_INT(ip->ip_sum);
++
++	TEST_INT(udp->uh_sport);
++	TEST_INT(udp->uh_dport);
++	TEST_INT(ntohs(udp->uh_ulen));
++	TEST_INT(udp->uh_sum);
++
++	printf("payload: %s\n", payload);
++}
++#endif
++
++static bool
++build_udp_packet(char *buf, int *pkt_size, uint64_t *seed)
++{
++	//struct ether_header *eh = (struct ether_header *)buf;
++	struct ether_hdr *eh = (struct ether_hdr *)buf;
++	struct ip *ip = (struct ip *)(eh + 1);
++	struct udphdr *udp = (struct udphdr *)(ip + 1);
++	unsigned int lcore_id = rte_lcore_id();
++	char *payload = (char *)(udp + 1);
++	int __rte_unused i;
++
++	eh->d_addr.addr_bytes[0] = 0x00;
++	eh->d_addr.addr_bytes[1] = 0x00;
++	eh->d_addr.addr_bytes[2] = 0x00;
++	eh->d_addr.addr_bytes[3] = 0x00;
++	eh->d_addr.addr_bytes[4] = 0x00;
++	eh->d_addr.addr_bytes[5] = 0x01;
++
++	eh->s_addr.addr_bytes[0] = 0x00;
++	eh->s_addr.addr_bytes[1] = 0x00;
++	eh->s_addr.addr_bytes[2] = 0x00;
++	eh->s_addr.addr_bytes[3] = 0x00;
++	eh->s_addr.addr_bytes[4] = 0x01;
++	eh->s_addr.addr_bytes[5] = (uint8_t)lcore_id;
++
++	eh->ether_type = htons(ETHER_TYPE_IPv4);
++
++	ip->ip_v = IPVERSION;
++	ip->ip_hl = 5;
++	ip->ip_tos = IPTOS_LOWDELAY;
++	/*
++	 * x86/endian.h:
++	 *
++	 * #define __htonl(x)      __bswap32(x)
++	 * #define __htons(x)      __bswap16(x)
++	 * #define __ntohl(x)      __bswap32(x)
++	 * #define __ntohs(x)      __bswap16(x)
++	 *
++	 * htonX() and ntohX() is same, so, it's easy to understand
++	 * the ntohs() here.
++	 */
++	ip->ip_len = ntohs(*pkt_size - sizeof(*eh));
++	ip->ip_id = 0;
++	ip->ip_off = htons(IP_DF); /* Don't fragment */
++	ip->ip_ttl = IPDEFTTL;
++	ip->ip_p = IPPROTO_UDP;
++	ip->ip_dst.s_addr = htonl(0x0a0a0a01);
++	ip->ip_src.s_addr = htonl(myrand(seed));
++	ip->ip_sum = 0;
++
++	udp->uh_sport = htons(myrand(seed));
++	udp->uh_dport = htons(myrand(seed));
++	udp->uh_ulen = htons(*pkt_size - sizeof(*eh) - sizeof(*ip));
++	udp->uh_sum = 0;
++
++	*(payload +  0) = 'h';
++	*(payload +  1) = 'e';
++	*(payload +  2) = 'l';
++	*(payload +  3) = 'l';
++	*(payload +  4) = 'o';
++	*(payload +  5) = ',';
++	*(payload +  6) = ' ';
++	*(payload +  7) = 'w';
++	*(payload +  8) = 'o';
++	*(payload +  9) = 'r';
++	*(payload + 10) = 'l';
++	*(payload + 11) = 'd';
++	*(payload + 12) = '.';
++	*(payload + 13) = '\0';
++	/*
++	for (i = 0; i < 1000; i++) {
++		*(payload + 14 + i) = '.';
++	}
++	*/
++
++	//dump_packet(buf, *pkt_size);
++
++	return (true);
++}
++
++static bool
++build_tcp_packet(char *buf, int *pkt_size,
++		 __attribute__((unused)) uint64_t *seed)
++{
++	const unsigned lcore_id = rte_lcore_id();
++	struct file_cache *fc = lcore_file_cache[lcore_id];
++
++	struct pcap_pkthdr_ondisk {
++		uint32_t ts_sec;
++		uint32_t ts_usec;
++		uint32_t caplen;
++		uint32_t len;
++	} *pcap_hdr;
++
++	int32_t caplen;
++	char *pktdata;
++
++	if (fc->offset == fc->size) {
++		printf("Send file %s complete\n", fc->filename);
++
++		if (munmap(fc->fcache, fc->size) == -1) {
++			fprintf(stderr, "munmap: %s\n", strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++
++		fc = fc->next;
++		if (fc == NULL) {
++			printf("All trace files assigned to Lcore %u "
++			       "are sent.\n", lcore_id);
++			return (false);
++		}
++
++		lcore_file_cache[lcore_id] = fc;
++	}
++
++	pcap_hdr = (struct pcap_pkthdr_ondisk *)(fc->fcache + fc->offset);
++	caplen = pcap_hdr->caplen;
++	pktdata = (char *)(pcap_hdr + 1);
++
++	fc->offset += sizeof(*pcap_hdr) + caplen;
++
++	if (caplen > MAX_PKT_LEN) {
++		fprintf(stderr, "Wrong packet length %u at offset %lu in %s\n",
++		       caplen, fc->offset, fc->filename);
++		exit(EXIT_FAILURE);
++	}
++
++	if (fc->offset > fc->size) {
++		fprintf(stderr, "Last packet is thrown away in %s\n",
++			fc->filename);
++		exit(EXIT_FAILURE);
++	}
++
++	*pkt_size = caplen;
++	memcpy(buf, pktdata, caplen);
++
++	return (true);
++}
++
++static inline void
++ia32_pause(void)
++{
++	__asm __volatile("pause");
++}
++
++static inline uint64_t
++read_tsc(void)
++{
++	uint64_t time;
++	uint32_t msw, lsw;
++	__asm__ __volatile__("rdtsc\n\t"
++			     "movl %%edx, %0\n\t"
++			     "movl %%eax, %1\n\t"
++			     : "=r" (msw), "=r"(lsw)
++			     :
++			     : "%edx", "%eax");
++	time = ((uint64_t) msw << 32) | lsw;
++	return time;
++}
++
++/* Main processing loop */
++static int
++main_loop(__attribute__((unused)) void *arg)
++{
++	unsigned long long __rte_unused cycle[10];
++	const unsigned lcore_id = rte_lcore_id();
++	int port_id = -1, queue_id = -1;
++	int i;
++	int num_cnt = 0;
++	uint64_t seed = time(NULL) + lcore_id;
++	bool looping = true;
++
++	if (!((1ULL << lcore_id) & cores_mask)) {
++		PRINT_INFO("Lcore %u has nothing to do (not configured)",
++			   lcore_id);
++		return (0);
++	}
++
++	if (func == TX && build_packet == build_tcp_packet &&
++	    lcore_file_cache[lcore_id] == NULL) {
++		PRINT_INFO("Lcore %u has nothing to do (no trace file "
++			   "assigned)", lcore_id);
++		return (0);
++	}
++
++	for (i = 0; i < nb_cores_conf; i++) {
++		if (lcore_id == cores_conf[i].core_id) {
++			port_id = cores_conf[i].port_id;
++			queue_id = cores_conf[i].queue_id;
++			break;
++		}
++	}
++
++	if (port_id == -1)
++		FATAL_ERROR("Configurations for lcore %u is not found",
++			    lcore_id);
++
++	port_ids[lcore_id] = port_id;
++	queue_ids[lcore_id] = queue_id;
++
++	gettimeofday(&last_time[lcore_id], NULL);
++
++	if (func == RX) {
++		PRINT_INFO("Lcore %u is reading from port %u, queue %u",
++		           lcore_id, port_id, queue_id);
++		fflush(stdout);
++		/* Loop forever reading from NIC */
++		for (;;) {
++			struct rte_mbuf *pkts_burst[PKT_BURST_SZ];
++			unsigned i;
++			const unsigned nb_rx =
++					rte_eth_rx_burst(port_id, queue_id,
++					    pkts_burst, PKT_BURST_SZ);
++			lcore_stats[lcore_id].rx_pkts += nb_rx;
++#if ADDRDBG
++			if (nb_rx != 0) {
++				printf("receive %d pkts\n", nb_rx);
++				printf("sizeof rte_mbuf: %lu\n", sizeof(struct rte_mbuf));
++			}
++#endif
++			for (i = 0; likely(i < nb_rx); i++) {
++				struct rte_mbuf *m = pkts_burst[i];
++				uint64_t len = rte_pktmbuf_data_len(m);
++				lcore_stats[lcore_id].rx_bytes += len;
++				//dump_packet(rte_pktmbuf_mtod(m, void *), len);
++#if ADDRDBG
++				printf("%d:\nrte_mbuf addr: %p, %llu\n"
++				       "rte_mbuf data addr: %p, %llu\n"
++				       "rte_mbuf offset of pktmbuf_pool: %p, %llu\n",
++				       i, m, (unsigned long long)m,
++				       rte_pktmbuf_mtod(m, void *),
++				       (unsigned long long)rte_pktmbuf_mtod(m, void *),
++				       (void *)((char *)m - (char *)pktmbuf_pool),
++				       (unsigned long long)((char *)m - (char *)pktmbuf_pool));
++				printf("rte_mbuf %llu + mbufsize %lu = %llu\n",
++				       (unsigned long long)m, sizeof(struct rte_mbuf),
++				       (unsigned long long)m + sizeof(struct rte_mbuf));
++#endif
++				rte_pktmbuf_free(m);
++			}
++
++			if (nb_rx != 0 && ++num_cnt == opt_interval) {
++				lcore_stats[lcore_id].rx_total_pkts +=
++					lcore_stats[lcore_id].rx_pkts;
++				lcore_stats[lcore_id].rx_total_bytes +=
++					lcore_stats[lcore_id].rx_bytes;
++				update_rx_stats(num_cnt);
++				lcore_stats[lcore_id].rx_pkts = 0;
++				lcore_stats[lcore_id].rx_bytes = 0;
++				num_cnt = 0;
++			}
++		}
++	} else { // TX
++		PRINT_INFO("Lcore %u is writing to port %u, queue %u",
++		           lcore_id, port_id, queue_id);
++		fflush(stdout);
++		/* Loop writing to NIC */
++		while (likely(looping)) {
++			int ret;
++			int32_t burst_size = opt_burst_size;
++			int32_t pkt_size = opt_pkt_size;
++			struct rte_mbuf *pkts_burst[PKT_BURST_SZ];
++			struct rte_mbuf *m;
++			struct rte_mbuf **mm;
++			static int __rte_unused once = 0;
++			if (npkt_limit && opt_pkt_nb <= 0)
++				break;
++			burst_size = opt_pkt_nb < burst_size && opt_pkt_nb > 0 ? opt_pkt_nb : burst_size;
++			cycle[4] = cycle[5] = 0;
++			cycle[0] = read_tsc();
++			for (i = 0; i < burst_size; i++) {
++			cycle[4] = read_tsc();
++				do {
++					m = rte_pktmbuf_alloc(pktmbuf_pool);
++				} while (unlikely(m == NULL));
++
++				if (unlikely(!((*build_packet)(
++						rte_pktmbuf_mtod(m, void *),
++						&pkt_size, &seed)))) {
++					rte_pktmbuf_free(m);
++					burst_size = i;
++					looping = false;
++					break;
++				}
++
++				m->pkt_len  = pkt_size;
++				m->data_len = pkt_size;
++				/*
++				printf("mbuf addr %d: %p\n", once++, m);
++				dump_mempool_addr((((uint64_t)m) >> 12) << 12);
++				*/
++
++				pkts_burst[i] = m;
++				lcore_stats[lcore_id].tx_bytes += pkt_size;
++			cycle[5] = read_tsc();
++			}
++			cycle[1] = read_tsc();
++			lcore_stats[lcore_id].tx_pkts += burst_size;
++
++			mm = pkts_burst;
++			cycle[2] = read_tsc();
++			while (1) {
++				/*
++				 * Failed packets has to been resent.
++				 * Because when sending pcap files,
++				 * all packets should be sent correctly
++				 * in order.
++				 */
++				/*
++				if (burst_size > 1)
++					dump_packet(rte_pktmbuf_mtod(mm[0], void *),
++						    rte_pktmbuf_data_len(mm[0]));
++						    */
++				/*
++				while (burst_size) {
++					burst_size--;
++					rte_pktmbuf_free(mm[burst_size]);
++				}
++				break;
++				*/
++				//printf("Press enter to continue...");
++				//getchar();
++				ret = rte_eth_tx_burst(port_id, queue_id, mm,
++						       burst_size);
++				/*
++				printf("ret: %d mm: %p\n", (int)ret, mm[0]);
++				dump_mempool_addr((((uint64_t)mm[0]) >> 12) << 12);
++				*/
++				if (likely(ret == burst_size))
++					break;
++				mm += ret;
++				burst_size -= ret;
++				//lcore_stats[lcore_id].dropped++;
++			}
++			cycle[3] = read_tsc();
++
++			if (++num_cnt == opt_interval) {
++				lcore_stats[lcore_id].tx_total_pkts +=
++					lcore_stats[lcore_id].tx_pkts;
++				lcore_stats[lcore_id].tx_total_bytes +=
++					lcore_stats[lcore_id].tx_bytes;
++				update_tx_stats(num_cnt);
++				lcore_stats[lcore_id].tx_pkts = 0;
++				lcore_stats[lcore_id].tx_bytes = 0;
++				num_cnt = 0;
++			}
++			if (npkt_limit) {
++				opt_pkt_nb -= burst_size;
++				if (opt_pkt_nb <= 0)
++					break;
++			}
++
++			for (i = 0; unlikely(i < opt_loop_count); i++)
++				ia32_pause();
++
++			if (once < 140) {
++				once ++;
++				printf("loop: %llu %llu %llu %llu %llu\n",
++					cycle[1] - cycle[0],
++					cycle[2] - cycle[1],
++					cycle[3] - cycle[2],
++					cycle[4] - cycle[3],
++					cycle[5] - cycle[4]
++					);
++			}
++		}
++	}
++
++	PRINT_INFO("Lcore %u has done the job, exiting.", lcore_id);
++	return (0);
++}
++
++/* Display usage instructions */
++static void
++print_usage(const char *prgname)
++{
++	PRINT_INFO("\nUsage: %s [EAL options] -- -f tx|rx -t tracelist -b\n"
++	           "    -t traicelist : trace list to send\n"
++	           "    -p packet size: packet size to generate (udp only)\n"
++	           "    -b burst size : burst size to use\n"
++	           "    -l loop count : number of loops to loop in each tx\n"
++	           "    -i interval   : interval during two update stats\n"
++	           "    -f tx|rx      : function to use\n",
++	           prgname);
++}
++
++/*
++static void
++parse_cores_and_ports(const char *optarg)
++{
++	unsigned lcore_id, port_id;
++	char *p;
++
++	while ((p = strchr(optarg, ',')) != NULL) {
++		*p = '\0';
++		sscanf(optarg, "%u:%u", &lcore_id, &port_id);
++		port_ids[lcore_id] = port_id;
++		cores_mask |= (1 << lcore_id);
++		optarg = p + 1;
++	}
++	sscanf(optarg, "%u:%u", &lcore_id, port_id);
++	port_ids[lcore_id] = port_id;
++	cores_mask |= (1 << lcore_id);
++}
++
++static uint64_t
++parse_cores_and_queues(const char *optarg)
++{
++	unsigned lcore_id, queue_id;
++	char *p;
++
++	while ((p = strchr(optarg, ',')) != NULL) {
++		*p = '\0';
++		sscanf(optarg, "%u:%u", &lcore_id, &queue_id);
++		queue_ids[lcore_id] = queue_id;
++		cores_mask |= (1 << lcore_id);
++		optarg = p + 1;
++	}
++	sscanf(optarg, "%u:%u", &lcore_id, port_id);
++	port_ids[lcore_id] = port_id;
++	cores_mask |= (1 << lcore_id);
++}
++*/
++
++static bool
++check_pcap(struct file_cache *fc)
++{
++	uint32_t *magic;
++
++	magic = (uint32_t *)fc->fcache;
++	if (*magic != 0xa1b2c3d4) {
++		fprintf(stderr, "Magic number not match %x:%x\n",
++			*magic, 0xa1b2c3d4);
++		return (false);
++	}
++
++	memcpy(&fc->hdr, fc->fcache + fc->offset, sizeof(fc->hdr));
++	fc->offset += sizeof(fc->hdr);
++
++	if (fc->offset > fc->size) {
++		fprintf(stderr, "Pcap file header is bigger than file size\n");
++		return (false);
++	}
++
++	return (true);
++}
++
++static void
++init_trace_file_cache(const char *tracefilelist)
++{
++	FILE *fp;
++	char tracefilename[MAXPATHLEN];
++	int rr = -1; /* Make sure rr begins from 0 */
++
++	fp = fopen(tracefilelist, "r");
++	if (fp == NULL) {
++		fprintf(stderr, "Failed to open %s: %s\n",
++			tracefilelist, strerror(errno));
++		exit(EXIT_FAILURE);
++	}
++
++	while (fgets(tracefilename, MAXPATHLEN, fp) != NULL) {
++		struct file_cache *fc;
++		int64_t size; /* XXX 'int' will overflow for 3GB files. */
++		tracefilename[strlen(tracefilename)-1] = '\0'; /* strip '\n' */
++		int fd = open(tracefilename, O_RDONLY);
++		if (fd == -1) {
++			fprintf(stderr, "Failed to open %s: %s\n",
++				tracefilename, strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++
++		size = lseek(fd, 0, SEEK_END);
++		if (size == -1) {
++			fprintf(stderr, "Failed to seek to end %s: %s\n",
++				tracefilename, strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++		if (lseek(fd, 0, SEEK_SET) == -1) {
++			fprintf(stderr, "Failed to seek to 0 %s: %s\n",
++				tracefilename, strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++
++		fc = malloc(sizeof(*fc));
++		if (fc == NULL) {
++			fprintf(stderr, "Failed to malloc filecache: %s\n",
++				strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++
++		strcpy(fc->filename, tracefilename);
++
++		fc->offset = 0;
++		fc->size = size;
++
++		fc->fcache = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
++		if (fc->fcache == MAP_FAILED) {
++			fprintf(stderr, "Failed to mmap %s: %s\n",
++				tracefilename, strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++
++		do {
++			rr = (rr + 1) % RTE_MAX_LCORE;
++		} while (!((1ULL << rr) & cores_mask));
++
++		fc->next = lcore_file_cache[rr];
++		lcore_file_cache[rr] = fc;
++
++		printf("Load tracefile: %s done, which assigned to Lcore %d\n",
++		       tracefilename, rr);
++
++		if (!check_pcap(fc)) {
++			fprintf(stderr, "Check pcap failed: %s\n",
++				tracefilename);
++			exit(EXIT_FAILURE);
++		}
++
++		close(fd);
++	}
++
++	fclose(fp);
++}
++
++static void
++parse_config_file(const char *filename)
++{
++	FILE *fp;
++	char buf[BUFSIZ];
++	int i;
++
++	if (access(filename, R_OK) == -1) {
++		fprintf(stderr, "Failed to read from file %s: %s\n",
++			filename, strerror(errno));
++		exit(EXIT_FAILURE);
++	}
++
++	fp = fopen(filename, "r");
++	if (fp == NULL) {
++		fprintf(stderr," Failed to open %s: %s\n", filename,
++			strerror(errno));
++		exit(EXIT_FAILURE);
++	}
++
++	while (fgets(buf, BUFSIZ, fp) != NULL) {
++		int core_id, port_id, queue_id;
++		int ret;
++
++		char *p = strchr(buf, '#');
++		if (p != NULL)
++			*p = '\0';
++#ifdef DEBUG_CONFIG_FILE
++		printf("------------------------------\n");
++		printf("parsed line: %s\n", buf);
++#endif
++		ret = sscanf(buf, "core_id=%d,port_id=%d,queue_id=%d",
++			     &core_id, &port_id, &queue_id);
++		if (ret != 3)
++			continue;
++#ifdef DEBUG_CONFIG_FILE
++		printf("core_id = %d, port_id = %d, queue_id = %d\n",
++			core_id, port_id, queue_id);
++#endif
++		cores_conf[nb_cores_conf].core_id  = core_id;
++		cores_conf[nb_cores_conf].port_id  = port_id;
++		cores_conf[nb_cores_conf].queue_id = queue_id;
++
++		nb_cores_conf++;
++	}
++
++	/* Parse cores and queues configuration */
++	for (i = 0; i < nb_cores_conf; i++) {
++		uint8_t core_id  = cores_conf[i].core_id;
++		uint8_t port_id  = cores_conf[i].port_id;
++		uint8_t queue_id = cores_conf[i].queue_id;
++
++		cores_mask |= (1 << core_id);
++		ports_mask |= (1 << port_id);
++		queues_masks[port_id] |= (1 << queue_id);
++	}
++}
++
++static void
++dump_args(void)
++{
++	int i;
++
++	putchar('\n');
++	for (i = 0; i < 80; i++) putchar('#');
++	putchar('\n');
++
++
++	printf("burst size    : %d\n", opt_burst_size);
++	printf("packet size   : %d\n", opt_pkt_size);
++
++	if (func == RX)
++		printf("function      : %s\n", "RX");
++	else
++		printf("function      : %s (%s)\n", "TX",
++		       (build_packet == build_tcp_packet) ? "TCP" : "UDP");
++
++	/*
++	 * Dump configurations.
++	 */
++	printf("nb_cores_conf : %d\n", nb_cores_conf);
++	printf("cores_conf    :");
++
++	for (i = 0; i < nb_cores_conf; i++) {
++		printf("%s{ .core_id = %d, .port_id = %d, .queue_id = %d }%s\n",
++		       i == 0 ? " " : "                ",
++		       cores_conf[i].core_id,
++		       cores_conf[i].port_id,
++		       cores_conf[i].queue_id,
++		       i != nb_cores_conf - 1 ? "," : " }");
++	}
++
++	for (i = 0; i < 80; i++) putchar('#');
++	putchar('\n');
++	putchar('\n');
++}
++
++static void
++sanity_check(void)
++{
++	bool failed = false;
++
++	if (nb_cores_conf == 0) {
++		fprintf(stderr, "Cores configuration file must be specified"
++			" by '-c config'.\n");
++		failed = true;
++	}
++
++	if (failed)
++		exit(EXIT_FAILURE);
++}
++
++/* Parse the arguments given in the command line of the application */
++static void
++parse_args(int argc, char **argv)
++{
++	int opt;
++	const char *prgname = argv[0];
++
++	/* Disable printing messages within getopt() */
++	opterr = 0;
++
++	/* Parse command line */
++	while ((opt = getopt(argc, argv, "s:n:f:t:p:b:l:i:c:h")) != -1) {
++		switch (opt) {
++		case 'n':
++			sscanf(optarg, "%d", &opt_pkt_nb);
++			npkt_limit = (opt_pkt_nb > 0);
++			break;
++		case 'f':
++			if (strcmp(optarg, "tx") == 0)
++				func = TX;
++			else if (strcmp(optarg, "rx") == 0)
++				func = RX;
++			else {
++				print_usage(prgname);
++				FATAL_ERROR("Invalid option for -f specified");
++			}
++			break;
++
++		case 't':
++			build_packet = build_tcp_packet;
++			strcpy(tracefilelist, optarg);
++
++			/*
++			 * Assign trace file to cpu needs
++			 * cores be configured.
++			 */
++			if (nb_cores_conf != 0)
++				init_trace_file_cache(tracefilelist);
++			break;
++
++		case 'p':
++			sscanf(optarg, "%d", &opt_pkt_size);
++			break;
++
++		case 'b':
++			sscanf(optarg, "%d", &opt_burst_size);
++			break;
++
++		case 'l':
++			sscanf(optarg, "%d", &opt_loop_count);
++			break;
++
++		case 'i':
++			sscanf(optarg, "%d", &opt_interval);
++			break;
++
++		case 'c':
++			parse_config_file(optarg);
++			if (tracefilelist[0] != '\0')
++				init_trace_file_cache(tracefilelist);
++			break;
++		
++		case 'h':
++			print_usage(prgname);
++			exit(EXIT_SUCCESS);
++			break;
++
++		default:
++			print_usage(prgname);
++			FATAL_ERROR("Invalid option %s specified", optarg);
++		}
++	}
++
++	sanity_check();
++	dump_args();
++}
++
++/* Initialise a single port on an Ethernet device */
++static void
++init_port(uint8_t port, uint8_t nb_queues)
++{
++	int ret;
++	uint8_t queue;
++
++	/* Initialise device and RX/TX queues */
++	PRINT_INFO("Initialising port %u ...", (unsigned)port);
++	fflush(stdout);
++
++	ret = rte_eth_dev_configure(port, nb_queues, nb_queues, &port_conf);
++	if (ret < 0)
++		FATAL_ERROR("Could not configure port%u (%d)",
++		            (unsigned)port, ret);
++
++	for (queue = 0; queue < nb_queues; queue++) {
++		if (!((1ULL << queue) & queues_masks[port]))
++			FATAL_ERROR("Discrete queue configuration");
++
++		ret = rte_eth_rx_queue_setup(port, queue, NB_RXD,
++					     rte_eth_dev_socket_id(port),
++					     &rx_conf, pktmbuf_pool);
++		if (ret < 0)
++			FATAL_ERROR("Could not setup up RX queue for "
++				    "port%u queue%u (%d)",
++				    (unsigned)port, (unsigned)queue, ret);
++	}
++
++	for (queue = 0; queue < nb_queues; queue++) {
++		if (!((1ULL << queue) & queues_masks[port]))
++			FATAL_ERROR("Discrete queue configuration");
++
++		ret = rte_eth_tx_queue_setup(port, queue, NB_TXD,
++					     rte_eth_dev_socket_id(port),
++					     &tx_conf);
++		if (ret < 0)
++			FATAL_ERROR("Could not setup up TX queue for "
++				    "port%u queue%u (%d)",
++				    (unsigned)port, (unsigned)queue, ret);
++	}
++
++	ret = rte_eth_dev_start(port);
++	if (ret < 0)
++		FATAL_ERROR("Could not start port%u (%d)", (unsigned)port, ret);
++
++	rte_eth_promiscuous_enable(port);
++}
++
++/* Check the link status of all ports in up to 9s, and print them finally */
++static void
++check_all_ports_link_status(uint8_t port_num, uint32_t port_mask)
++{
++#define CHECK_INTERVAL 100 /* 100ms */
++#define MAX_CHECK_TIME 90 /* 9s (90 * 100ms) in total */
++	uint8_t portid, count, all_ports_up, print_flag = 0;
++	struct rte_eth_link link;
++
++	printf("\nChecking link status");
++	fflush(stdout);
++	for (count = 0; count <= MAX_CHECK_TIME; count++) {
++		all_ports_up = 1;
++		for (portid = 0; portid < port_num; portid++) {
++			if ((port_mask & (1 << portid)) == 0)
++				continue;
++			memset(&link, 0, sizeof(link));
++			rte_eth_link_get_nowait(portid, &link);
++			/* print link status if flag set */
++			if (print_flag == 1) {
++				if (link.link_status)
++					printf("Port %d Link Up - speed %u "
++						"Mbps - %s\n", (uint8_t)portid,
++						(unsigned)link.link_speed,
++				(link.link_duplex == ETH_LINK_FULL_DUPLEX) ?
++					("full-duplex") : ("half-duplex\n"));
++				else
++					printf("Port %d Link Down\n",
++						(uint8_t)portid);
++				continue;
++			}
++			/* clear all_ports_up flag if any link down */
++			if (link.link_status == 0) {
++				all_ports_up = 0;
++				break;
++			}
++		}
++		/* after finally printing all link status, get out */
++		if (print_flag == 1)
++			break;
++
++		if (all_ports_up == 0) {
++			printf(".");
++			fflush(stdout);
++			rte_delay_ms(CHECK_INTERVAL);
++		}
++
++		/* set the print_flag if all ports up or timeout */
++		if (all_ports_up == 1 || count == (MAX_CHECK_TIME - 1)) {
++			print_flag = 1;
++			printf("done\n");
++		}
++	}
++}
++
++
++#include "mbuf.h"
++/* Initialise ports/queues etc. and start main loop on each core */
++int
++main(int argc, char *argv[])
++{
++	int ret;
++	int i;
++	uint8_t nb_sys_ports, nb_queues;
++	uint8_t port;
++	uint8_t bit;
++
++	/* Associate signal_hanlder function with USR signals */
++	signal(SIGUSR1, signal_handler);
++	signal(SIGUSR2, signal_handler);
++	signal(SIGINT, signal_handler);
++
++	/* Initialise EAL */
++	ret = rte_eal_init(argc, argv);
++	if (ret < 0)
++		FATAL_ERROR("Could not initialise EAL (%d)", ret);
++	argc -= ret;
++	argv += ret;
++
++	/* Parse application arguments (after the EAL ones) */
++	parse_args(argc, argv);
++
++
++#if 0
++#define ALIGN
++#ifndef ALIGN
++	/* Create the mbuf pool */
++	pktmbuf_pool = rte_mempool_create("mbuf_pool", NB_MBUF, MBUF_SZ,
++			MEMPOOL_CACHE_SZ,
++			sizeof(struct rte_pktmbuf_pool_private),
++			rte_pktmbuf_pool_init, NULL, rte_pktmbuf_init, NULL,
++			rte_socket_id(), 0);
++#else
++	pktmbuf_pool = my_get_aligned_mempool("mbuf_pool", NB_MBUF, MEMPOOL_CACHE_SZ,
++			sizeof(struct rte_pktmbuf_pool_private),
++			rte_pktmbuf_pool_init, NULL, rte_pktmbuf_init, NULL,
++			rte_socket_id(), RTE_MEMZONE_2MB);
++#endif
++#endif
++	pktmbuf_pool = my_pktmbuf_pool_create("mbuf_pool", NB_MBUF, MEMPOOL_CACHE_SZ,
++			0, 4096, rte_socket_id());
++	if (pktmbuf_pool == NULL) {
++		FATAL_ERROR("Could not initialise mbuf pool");
++		return (-1);
++	}
++	rte_mempool_dump(stdout, pktmbuf_pool);
++
++	/* Get number of ports found in scan */
++	nb_sys_ports = rte_eth_dev_count();
++	if (nb_sys_ports == 0)
++		FATAL_ERROR("No supported Ethernet devices found - check that "
++		            "CONFIG_RTE_LIBRTE_IGB_PMD=y and/or "
++		            "CONFIG_RTE_LIBRTE_IXGBE_PMD=y in the config file");
++	printf("number of ports: %d\n", nb_sys_ports);
++
++	/* Initialise each port */
++	for (port = 0; port < nb_sys_ports; port++) {
++		/* Skip ports that are not enabled */
++		if ((ports_mask & (1 << port)) == 0) {
++			continue;
++		}
++
++		nb_queues = 0;
++		for (bit = 0; bit < 8*sizeof(uint64_t); bit++)
++			nb_queues += ((queues_masks[port] >> bit) & 1);
++		printf("number of queues enabled for port%u: %d\n",
++			port, nb_queues);
++
++		init_port(port, nb_queues);
++	}
++	check_all_ports_link_status(nb_sys_ports, ports_mask);
++
++	/* Launch per-lcore function on every lcore */
++	rte_eal_mp_remote_launch(main_loop, NULL, CALL_MASTER);
++	RTE_LCORE_FOREACH_SLAVE(i) {
++		if (rte_eal_wait_lcore(i) < 0)
++			return (-1);
++	}
++
++	print_stats();
++
++	return (1);
++}
++
+diff --git a/examples/pktgen/pstat b/examples/pktgen/pstat
+new file mode 100755
+index 0000000..567c7e3
+--- /dev/null
++++ b/examples/pktgen/pstat
+@@ -0,0 +1 @@
++sudo kill -USR1 
+diff --git a/lib/librte_eal/linuxapp/Makefile b/lib/librte_eal/linuxapp/Makefile
+index d9c5233..efd2b7b 100644
+--- a/lib/librte_eal/linuxapp/Makefile
++++ b/lib/librte_eal/linuxapp/Makefile
+@@ -42,4 +42,7 @@ ifeq ($(CONFIG_RTE_LIBRTE_XEN_DOM0),y)
+ DIRS-$(CONFIG_RTE_LIBRTE_EAL_LINUXAPP) += xen_dom0
+ endif
+ 
++DIRS-$(CONFIG_RTE_LIBRTE_EAL_LINUXAPP) += hypercall
++DIRS-$(CONFIG_RTE_LIBRTE_EAL_LINUXAPP) += tlb
++
+ include $(RTE_SDK)/mk/rte.subdir.mk
+diff --git a/lib/librte_eal/linuxapp/hypercall/Makefile b/lib/librte_eal/linuxapp/hypercall/Makefile
+new file mode 100644
+index 0000000..9f79980
+--- /dev/null
++++ b/lib/librte_eal/linuxapp/hypercall/Makefile
+@@ -0,0 +1,53 @@
++#   BSD LICENSE
++#
++#   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
++#   All rights reserved.
++#
++#   Redistribution and use in source and binary forms, with or without
++#   modification, are permitted provided that the following conditions
++#   are met:
++#
++#     * Redistributions of source code must retain the above copyright
++#       notice, this list of conditions and the following disclaimer.
++#     * Redistributions in binary form must reproduce the above copyright
++#       notice, this list of conditions and the following disclaimer in
++#       the documentation and/or other materials provided with the
++#       distribution.
++#     * Neither the name of Intel Corporation nor the names of its
++#       contributors may be used to endorse or promote products derived
++#       from this software without specific prior written permission.
++#
++#   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++#   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++#   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++#   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++#   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++#   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++#   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++#   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++#   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++#   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++#   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++include $(RTE_SDK)/mk/rte.vars.mk
++
++#
++# module name and path
++#
++MODULE = hypercall
++#MODULE_PATH = drivers/net/hypercall
++
++#
++# CFLAGS
++#
++MODULE_CFLAGS += -I$(SRCDIR) --param max-inline-insns-single=100
++MODULE_CFLAGS += -I$(RTE_OUTPUT)/include
++MODULE_CFLAGS += -Winline -Wall -Werror
++MODULE_CFLAGS += -include $(RTE_OUTPUT)/include/rte_config.h
++
++#
++# all source are stored in SRCS-y
++#
++SRCS-y := hypercall.c
++
++include $(RTE_SDK)/mk/rte.module.mk
+diff --git a/lib/librte_eal/linuxapp/hypercall/hypercall.c b/lib/librte_eal/linuxapp/hypercall/hypercall.c
+new file mode 100644
+index 0000000..6de7e6d
+--- /dev/null
++++ b/lib/librte_eal/linuxapp/hypercall/hypercall.c
+@@ -0,0 +1,57 @@
++#include <linux/module.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/file.h>
++#include <asm/kvm_para.h>
++#include <asm/uaccess.h>
++
++static long kvm_hypercall_ioctl(struct file *filp,
++				unsigned int ioctl, unsigned long arg)
++{
++	long ret;
++	unsigned long long addr[2];
++	copy_from_user(addr, (void __user *)arg, sizeof(addr));
++	printk(KERN_INFO "addr[0]: %llu, addr[1]: %llu.\n", addr[0], addr[1]);
++	switch (ioctl) {
++	case 0:
++		ret = kvm_hypercall2(0, addr[0], addr[1]);
++		break;
++	default:
++		return -EINVAL;
++	}
++	return ret;
++}
++
++static struct file_operations kvm_hypercall_ops = {
++	.owner = THIS_MODULE,
++	.unlocked_ioctl = kvm_hypercall_ioctl,
++};
++
++static struct miscdevice kvm_hypercall_dev = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "kvm-hypercall",
++	.fops = &kvm_hypercall_ops,
++};
++
++static int __init
++hypercall_init_module(void)
++{
++	int ret;
++	printk(KERN_INFO "hypercall_init\n");
++	ret = misc_register(&kvm_hypercall_dev);
++	return 0;
++}
++
++static void __exit
++hypercall_exit_module(void)
++{
++	misc_deregister(&kvm_hypercall_dev);
++	printk(KERN_INFO "hypercall_exit\n");
++}
++
++module_init(hypercall_init_module);
++module_exit(hypercall_exit_module);
++
++MODULE_DESCRIPTION("Hypercall for virtio\n");
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("DYW");
+diff --git a/lib/librte_eal/linuxapp/tlb/Makefile b/lib/librte_eal/linuxapp/tlb/Makefile
+new file mode 100644
+index 0000000..67e0a1a
+--- /dev/null
++++ b/lib/librte_eal/linuxapp/tlb/Makefile
+@@ -0,0 +1,53 @@
++#   BSD LICENSE
++#
++#   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
++#   All rights reserved.
++#
++#   Redistribution and use in source and binary forms, with or without
++#   modification, are permitted provided that the following conditions
++#   are met:
++#
++#     * Redistributions of source code must retain the above copyright
++#       notice, this list of conditions and the following disclaimer.
++#     * Redistributions in binary form must reproduce the above copyright
++#       notice, this list of conditions and the following disclaimer in
++#       the documentation and/or other materials provided with the
++#       distribution.
++#     * Neither the name of Intel Corporation nor the names of its
++#       contributors may be used to endorse or promote products derived
++#       from this software without specific prior written permission.
++#
++#   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++#   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++#   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++#   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++#   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++#   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++#   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++#   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++#   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++#   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++#   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++include $(RTE_SDK)/mk/rte.vars.mk
++
++#
++# module name and path
++#
++MODULE = tlb_ctl
++MODULE_PATH = drivers/net/tlb_ctl
++
++#
++# CFLAGS
++#
++MODULE_CFLAGS += -I$(SRCDIR) --param max-inline-insns-single=100
++MODULE_CFLAGS += -I$(RTE_OUTPUT)/include
++MODULE_CFLAGS += -Winline -Wall -Werror
++MODULE_CFLAGS += -include $(RTE_OUTPUT)/include/rte_config.h
++
++#
++# all source are stored in SRCS-y
++#
++SRCS-y := tlb_ctl.c
++
++include $(RTE_SDK)/mk/rte.module.mk
+diff --git a/lib/librte_eal/linuxapp/tlb/tlb_ctl.c b/lib/librte_eal/linuxapp/tlb/tlb_ctl.c
+new file mode 100644
+index 0000000..3f88a56
+--- /dev/null
++++ b/lib/librte_eal/linuxapp/tlb/tlb_ctl.c
+@@ -0,0 +1,92 @@
++#include <linux/module.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/file.h>
++#include <linux/types.h>
++#include <linux/kvm_host.h>
++#include <linux/sched.h>
++#include <linux/mm.h>
++#include <linux/init.h>
++#include <linux/page-flags.h>
++#include <linux/gfp.h>
++#include <asm/kvm_para.h>
++#include <asm/paravirt.h>
++#include <asm/uaccess.h>
++#include <asm/page.h>
++#include <asm/pgalloc.h>
++#include <asm/pgtable.h>
++
++static unsigned long *buffer;
++
++static long tlb_ctl_ioctl(struct file *filp,
++			  unsigned int ioctl, unsigned long arg)
++{
++	int num, i;
++	switch (ioctl) {
++	case 0:
++		__flush_tlb();
++		/*
++		num = arg;
++		for (i = 0; i < num; i++) {
++			asm volatile("invlpg (%0)" ::"r" (buffer[i]) : "memory");
++			// __flush_tlb_single(buffer[i]);
++		}*/
++		break;
++	case 1:
++		num = arg;
++		for (i = 0; i < num; i++) {
++			asm volatile("invlpg (%0)" ::"r" (buffer[i]) : "memory");
++		}
++	}
++	return 0;
++}
++static int tlb_ctl_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	unsigned long page;
++	unsigned long start = (unsigned long)vma->vm_start;
++	unsigned long size = (unsigned long)(vma->vm_end - vma->vm_start);
++
++	page = virt_to_phys(buffer);
++	if (remap_pfn_range(vma, start, page >> PAGE_SHIFT, size, PAGE_SHARED))
++		return -1;
++	return 0;
++}
++
++static struct file_operations tlb_ctl_ops = {
++	.owner = THIS_MODULE,
++	.unlocked_ioctl = tlb_ctl_ioctl,
++	.mmap = tlb_ctl_mmap,
++};
++
++static struct miscdevice tlb_ctl_dev = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "tlb_ctl",
++	.fops = &tlb_ctl_ops,
++};
++
++static int __init
++tlb_ctl_init_module(void)
++{
++	int ret;
++	printk(KERN_INFO "tlb_ctl_init\n");
++	ret = misc_register(&tlb_ctl_dev);
++	buffer = (void *)__get_free_pages(GFP_KERNEL, 0);
++	if (buffer)
++		SetPageReserved(virt_to_page(buffer));
++	return 0;
++}
++static void __exit
++tlb_ctl_exit_module(void)
++{
++	misc_deregister(&tlb_ctl_dev);
++	ClearPageReserved(virt_to_page(buffer));
++	free_pages((unsigned long)buffer, 0);
++	printk(KERN_INFO "tlb_ctl_exit\n");
++}
++
++module_init(tlb_ctl_init_module);
++module_exit(tlb_ctl_exit_module);
++
++MODULE_DESCRIPTION("EPT for vhost control module");
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("DYW");

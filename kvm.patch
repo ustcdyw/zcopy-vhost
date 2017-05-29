@@ -1,0 +1,630 @@
+diff --git a/arch/x86/kvm/Makefile b/arch/x86/kvm/Makefile
+index 08f790d..1992873 100644
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -8,11 +8,14 @@ CFLAGS_vmx.o := -I.
+ KVM := ../../../virt/kvm
+ 
+ kvm-y			+= $(KVM)/kvm_main.o $(KVM)/coalesced_mmio.o \
+-				$(KVM)/eventfd.o $(KVM)/irqchip.o $(KVM)/vfio.o
++				$(KVM)/eventfd.o $(KVM)/irqchip.o \
++				$(KVM)/vfio.o $(KVM)/dprint.o
+ kvm-$(CONFIG_KVM_ASYNC_PF)	+= $(KVM)/async_pf.o
+ 
+ kvm-y			+= x86.o mmu.o emulate.o i8259.o irq.o lapic.o \
+ 			   i8254.o ioapic.o irq_comm.o cpuid.o pmu.o
++
++
+ kvm-$(CONFIG_KVM_DEVICE_ASSIGNMENT)	+= assigned-dev.o iommu.o
+ kvm-intel-y		+= vmx.o
+ kvm-amd-y		+= svm.o
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index 72cc11a..f3bb002 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -178,6 +178,22 @@ struct kvm_shadow_walk_iterator {
+ 		({ spte = mmu_spte_get_lockless(_walker.sptep); 1; });	\
+ 	     __shadow_walk_next(&(_walker), spte))
+ 
++// dyw added at 2017-01-11
++
++struct no_rmap {
++	struct kvm *kvm;
++	u64 gfn;
++	u64 len;
++};
++
++#define MAX_RMAP 1024
++
++// XXX Just support 32 VMs at most;
++struct no_rmap no_rmap[MAX_RMAP];
++//static u64 no_rmap_gfn = 0;
++/* len should be equal real len */
++//static u64 no_rmap_len = 0;
++
+ static struct kmem_cache *pte_list_desc_cache;
+ static struct kmem_cache *mmu_page_header_cache;
+ static struct percpu_counter kvm_total_used_mmu_pages;
+@@ -189,6 +205,7 @@ static u64 __read_mostly shadow_accessed_mask;
+ static u64 __read_mostly shadow_dirty_mask;
+ static u64 __read_mostly shadow_mmio_mask;
+ 
++
+ static void mmu_spte_set(u64 *sptep, u64 spte);
+ static void mmu_free_roots(struct kvm_vcpu *vcpu);
+ 
+@@ -1065,9 +1082,22 @@ static void rmap_remove(struct kvm *kvm, u64 *spte)
+ 	struct kvm_mmu_page *sp;
+ 	gfn_t gfn;
+ 	unsigned long *rmapp;
++	int i;
+ 
+ 	sp = page_header(__pa(spte));
+ 	gfn = kvm_mmu_page_get_gfn(sp, spte - sp->spt);
++	for (i = 0; i < MAX_RMAP; i++) {
++		if (no_rmap[i].kvm == kvm &&
++			gfn >= no_rmap[i].gfn &&
++			gfn < no_rmap[i].gfn + no_rmap[i].len &&
++			sp->role.level == 1)
++			return;
++	}
++	/*
++	if (gfn >= no_rmap_gfn && gfn < no_rmap_gfn + no_rmap_len
++	    && sp->role.level == 1 && no_rmap_gfn != 0)
++		return;
++	*/
+ 	rmapp = gfn_to_rmap(kvm, gfn, sp->role.level);
+ 	pte_list_remove(spte, rmapp);
+ }
+@@ -1089,6 +1119,7 @@ struct rmap_iterator {
+  *
+  * Returns sptep if found, NULL otherwise.
+  */
++
+ static u64 *rmap_get_first(unsigned long rmap, struct rmap_iterator *iter)
+ {
+ 	if (!rmap)
+@@ -1359,6 +1390,19 @@ static int kvm_unmap_rmapp(struct kvm *kvm, unsigned long *rmapp,
+ 	struct rmap_iterator iter;
+ 	int need_tlb_flush = 0;
+ 
++	int i;
++	for (i = 0; i < MAX_RMAP; i++) {
++		if (no_rmap[i].kvm == kvm &&
++			gfn >= no_rmap[i].gfn &&
++			gfn < no_rmap[i].gfn + no_rmap[i].len &&
++			level == 1)
++			return 0;
++	}
++	/*
++	if (level == 1 && gfn >= no_rmap_gfn && gfn < no_rmap_gfn + no_rmap_len)
++		return 0;
++	*/
++
+ 	while ((sptep = rmap_get_first(*rmapp, &iter))) {
+ 		BUG_ON(!(*sptep & PT_PRESENT_MASK));
+ 		rmap_printk("kvm_rmap_unmap_hva: spte %p %llx gfn %llx (%d)\n",
+@@ -2753,12 +2797,32 @@ static int __direct_map(struct kvm_vcpu *vcpu, gpa_t v, int write,
+ 	struct kvm_shadow_walk_iterator iterator;
+ 	struct kvm_mmu_page *sp;
+ 	int emulate = 0;
++	// unsigned i = 0;
+ 	gfn_t pseudo_gfn;
+ 
+ 	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
+ 		return 0;
+ 
++	/*
++	printk(KERN_INFO "level: %d, gfn: %llx, pfn: %llx",
++			level, gfn, pfn);
++			*/
+ 	for_each_shadow_entry(vcpu, (u64)gfn << PAGE_SHIFT, iterator) {
++		/*
++		printk(KERN_INFO "addr:%llx, sh_a:%llx, sptep:%p, level:%d, index:%u\n",
++				iterator.addr, iterator.shadow_addr, iterator.sptep,
++				iterator.level, iterator.index);
++		if (iterator.level == level) {
++			u64 *is = (u64 *)((((u64)iterator.sptep) >> 12) << 12);
++			for (i = 0; i < 512; i++) {
++				if (*(is + i) != 0)
++					printk(KERN_INFO "%d-%d-%3u: %p, %llx\n",
++						iterator.level != level,
++						iterator.level,
++						i, is + i,
++						*(is + i));
++			}
++		} */
+ 		if (iterator.level == level) {
+ 			mmu_set_spte(vcpu, iterator.sptep, ACC_ALL,
+ 				     write, &emulate, level, gfn, pfn,
+@@ -2767,7 +2831,19 @@ static int __direct_map(struct kvm_vcpu *vcpu, gpa_t v, int write,
+ 			++vcpu->stat.pf_fixed;
+ 			break;
+ 		}
+-
++		/*
++		for (i = 0; i < 512; i++) {
++			u64 *is = (u64 *)((((u64)iterator.sptep) >> 12) << 12);
++			if (*(iterator.sptep + i) != 0)
++				printk(KERN_INFO "%d-%d-%3u: %p, %llx\n",
++					iterator.level != level,
++					iterator.level,
++					i, is + i,
++					*(is + i));
++		}
++		if (iterator.level == level) {
++			break;
++		} */
+ 		drop_large_spte(vcpu, iterator.sptep);
+ 		if (!is_shadow_present_pte(*iterator.sptep)) {
+ 			u64 base_addr = iterator.addr;
+@@ -3015,6 +3091,256 @@ static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
+ 			 gva_t gva, pfn_t *pfn, bool write, bool *writable);
+ static void make_mmu_pages_available(struct kvm_vcpu *vcpu);
+ 
++static int ept_mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
++			    unsigned pte_access, gfn_t gfn, pfn_t pfn)
++{
++	int level = 1;
++
++	if (is_rmap_spte(*sptep)) {
++		if (pfn != spte_to_pfn(*sptep)) {
++			/*
++			printk(KERN_INFO "hfn old %llx new %llx\n",
++				 spte_to_pfn(*sptep), pfn);
++				 */
++			mmu_spte_clear_track_bits(sptep);
++			/* We abandon rmap here.
++			 * */
++			// drop_spte(vcpu->kvm, sptep);
++			kvm_flush_remote_tlbs(vcpu->kvm);
++		}
++	}
++	if (set_spte(vcpu, sptep, pte_access, level, gfn, pfn, false,
++		false, true)) {
++		kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
++	}
++	return 0;
++}
++
++#define EPT_RMAP_NUM_MAX 8192
++#define EPT_RMAP_MAX 1024
++static atomic_t ept_rmap_num = ATOMIC_INIT(-1);
++struct ept_rmap {
++	u64 gfn_base;
++	u64 rmap_len;
++	u64 *rmap[0];
++};
++/* do not need a lock here, because even if there are more than one thread
++ * using the same mempool, their all gfns will be different.
++ */
++static struct ept_rmap *ept_rmap[EPT_RMAP_MAX];
++#if 0
++static void ept_flush_tlbs(void)
++{
++	struct kvm *kvm;
++	/* TODO We donot use lock for just for experiment. */
++	list_for_each_entry(kvm, &vm_list, vm_list) {
++		kvm_flush_remote_tlbs(kvm);
++		break;
++	}
++}
++#endif
++
++int kvm_ept_map(int rmap_id, u64 *map, int page_num)
++{
++	u64 base, len;
++	u64 gfn, pfn, spte;
++	u64 *sptep;
++	int i;
++	struct ept_rmap *rmap;
++	if ((unsigned)rmap_id >= EPT_RMAP_MAX) {
++		return -EINVAL;
++	}
++	rmap = ept_rmap[rmap_id];
++	if (rmap == NULL) {
++		printk(KERN_INFO "rmap is NULL\n");
++		return -EINVAL;
++	}
++	len = rmap->rmap_len;
++	if ((unsigned)page_num >= len) {
++		printk(KERN_INFO "page_num:%d is invalid rmap_len=%d\n",
++			(int)page_num, (int)len);
++		return -EINVAL;
++	}
++	base = rmap->gfn_base;
++	for (i = 0; i < page_num; i++) {
++		/* TODO check arg vaildiation */
++		gfn = map[2*i];
++		pfn = map[2*i + 1];
++		if (gfn - base < 0 || gfn - base >= 8192)
++			return -1;
++		sptep = rmap->rmap[gfn - base];
++		spte = (*sptep & ((1 << PAGE_SHIFT) - 1)) | (pfn << PAGE_SHIFT);
++		__set_spte(sptep, spte);
++		// ept_flush_tlbs();
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(kvm_ept_map);
++void
++kvm_ept_direct_map(struct kvm_vcpu *, struct ept_rmap *, int, gfn_t, pfn_t);
++
++/* len should less than or equal 8192 */
++int kvm_ept_map_init(struct kvm_vcpu *vcpu, gfn_t gfn, u64 *map,
++		int cpy_len, int start, u64 page_num, int rmap_num)
++{
++	int i;
++	int found = 0;
++	// unsigned long *rmapp;
++	/*TODO multi no_rmap_gfn */
++	if (page_num > EPT_RMAP_NUM_MAX)
++		return -EINVAL;
++	if (vcpu == NULL) {
++		/* Just use the first vcpu in the first kvm. */
++		struct kvm *kvm;
++		spin_lock(&kvm_lock);
++		list_for_each_entry(kvm, &vm_list, vm_list) {
++			kvm_for_each_vcpu(i, vcpu, kvm)
++				if (vcpu != NULL) {
++					found = 1;
++					break;
++				}
++			break;
++		}
++		spin_unlock(&kvm_lock);
++	}
++	if (found == 0) {
++		struct kvm *kvm;
++		struct kvm_vcpu *v;
++		spin_lock(&kvm_lock);
++		list_for_each_entry(kvm, &vm_list, vm_list) {
++			kvm_for_each_vcpu(i, v, kvm)
++				if (vcpu == v) {
++					found = 1;
++					break;
++				}
++		}
++		spin_unlock(&kvm_lock);
++		if (found == 0)
++			return -2;
++	}
++	if (start == 0 && rmap_num == -1) {
++		int i;
++		for (i = 0; i < MAX_RMAP; i++) {
++			if (no_rmap[i].kvm == NULL) {
++				no_rmap[i].kvm = vcpu->kvm;
++				no_rmap[i].gfn = gfn;
++				no_rmap[i].len = page_num;
++				break;
++			}
++		}
++		if (i >= MAX_RMAP)
++			return -2;
++		// no_rmap_gfn = gfn;
++		// no_rmap_len = page_num;
++		printk(KERN_INFO "direct map gfn: %llx len: %llu\n", gfn, page_num);
++		rmap_num = atomic_inc_return(&ept_rmap_num);
++		printk(KERN_INFO "rmap_num=%d\n", rmap_num);
++		if (rmap_num >= EPT_RMAP_MAX)
++			return -1;
++		ept_rmap[rmap_num] = kmalloc(
++			sizeof(struct ept_rmap) + sizeof(u64)*page_num*2, GFP_KERNEL);
++		ept_rmap[rmap_num]->gfn_base = gfn;
++		ept_rmap[rmap_num]->rmap_len = page_num;
++	}
++	if (rmap_num < 0 || rmap_num >= EPT_RMAP_MAX) {
++		printk(KERN_INFO "rmap_num=%d error occured.\n", rmap_num);
++		return -1;
++	}
++	if (ept_rmap[rmap_num] == NULL) {
++		printk(KERN_INFO "ept_rmap[%d] is NULL, error occured.\n", rmap_num);
++		return -1;
++	}
++	for (i = start; i < start + cpy_len; i++) {
++		/* TODO topup_memory return check?*/
++		mmu_topup_memory_caches(vcpu);
++		spin_lock(&vcpu->kvm->mmu_lock);
++		make_mmu_pages_available(vcpu);
++		/*
++		printk(KERN_INFO "i:%d gfn:%llx start:%d map[i-start]:%llx\n",
++			i, (unsigned long long)gfn, start,
++			(unsigned long long)map[i-start]);
++			*/
++		kvm_ept_direct_map(vcpu, ept_rmap[rmap_num], i, gfn + i, map[i-start]);
++		spin_unlock(&vcpu->kvm->mmu_lock);
++	}
++		/*
++		rmapp = gfn_to_rmap(vcpu->kvm, gfn+i, 1);
++		if (*rmapp) {
++			printk(KERN_INFO "rmapp: %llx", gfn + i);
++		}
++		*/
++	return rmap_num;
++}
++EXPORT_SYMBOL_GPL(kvm_ept_map_init);
++
++void kvm_ept_direct_map(struct kvm_vcpu *vcpu, struct ept_rmap *rmap, int idx,
++		gfn_t gfn, pfn_t pfn)
++{
++	struct kvm_shadow_walk_iterator iterator;
++	struct kvm_mmu_page *sp;
++	gfn_t pseudo_gfn;
++	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa)) {
++		return;
++	}
++	for_each_shadow_entry(vcpu, (u64)gfn << PAGE_SHIFT, iterator) {
++		/*
++		printk(KERN_INFO "addr:%llx, sh_a:%llx, sptep:%p, level:%d, index:%u\n",
++				iterator.addr, iterator.shadow_addr, iterator.sptep,
++				iterator.level, iterator.index);
++				*/
++		/*
++		if (iterator.level == 1) {
++			u64 *is = (u64 *)((((u64)iterator.sptep) >> 12) << 12);
++			for (i = 0; i < 512; i++) {
++				if (*(is + i) != 0)
++					printk(KERN_INFO "pre: %d-%d-%3u: %p, %llx\n",
++						iterator.level == 1,
++						iterator.level,
++						i, is + i,
++						*(is + i));
++			}
++		}*/
++		if (iterator.level == 1) {
++			if (gfn >= 0x2bf75 && gfn < 0x2c010) {
++				printk(KERN_INFO "%llx: %llx. ", gfn, pfn);
++			}
++			rmap->rmap[idx] = iterator.sptep;
++			ept_mmu_set_spte(vcpu, iterator.sptep, ACC_ALL,
++					 gfn, pfn);
++			direct_pte_prefetch(vcpu, iterator.sptep);
++			// break;
++		}
++		/*
++		for (i = 0; i < 512; i++) {
++			u64 *is = (u64 *)((((u64)iterator.sptep) >> 12) << 12);
++			if (*(is + i) != 0)
++				printk(KERN_INFO "%d-%d-%3u: %p, %llx\n",
++					iterator.level == 1,
++					iterator.level,
++					i, is + i,
++					*(is + i));
++		}*/
++		if (iterator.level == 1) {
++			break;
++		}
++		drop_large_spte(vcpu, iterator.sptep);
++
++		if (!is_shadow_present_pte(*iterator.sptep)) {
++			u64 base_addr = iterator.addr;
++
++			base_addr &= PT64_LVL_ADDR_MASK(iterator.level);
++			pseudo_gfn = base_addr >> PAGE_SHIFT;
++			sp = kvm_mmu_get_page(vcpu, pseudo_gfn, iterator.addr,
++					      iterator.level - 1,
++					      1, ACC_ALL, iterator.sptep);
++
++			link_shadow_page(iterator.sptep, sp, true);
++		}
++	}
++	return;
++}
++
++
+ static int nonpaging_map(struct kvm_vcpu *vcpu, gva_t v, u32 error_code,
+ 			 gfn_t gfn, bool prefault)
+ {
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 8368cf0..9754086 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -5356,8 +5356,16 @@ static int handle_halt(struct kvm_vcpu *vcpu)
+ 
+ static int handle_vmcall(struct kvm_vcpu *vcpu)
+ {
++	int ret;
+ 	skip_emulated_instruction(vcpu);
+-	kvm_emulate_hypercall(vcpu);
++	ret = kvm_emulate_hypercall(vcpu);
++	/* return <= 0 will cause exit to userspace. */
++	if (ret == -1) {
++		/* Because qemu will check the return value
++		 * if it equals -1, it will set it to -errno.
++		 * We set it 0 directly */
++		return 0;
++	}
+ 	return 1;
+ }
+ 
+@@ -9620,7 +9628,9 @@ static struct kvm_x86_ops vmx_x86_ops = {
+ 
+ static int __init vmx_init(void)
+ {
+-	int r = kvm_init(&vmx_x86_ops, sizeof(struct vcpu_vmx),
++	int r;
++	printk(KERN_INFO "kvm_intel: init\n");
++	r = kvm_init(&vmx_x86_ops, sizeof(struct vcpu_vmx),
+                      __alignof__(struct vcpu_vmx), THIS_MODULE);
+ 	if (r)
+ 		return r;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 59bffa9..070b631 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5908,6 +5908,22 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	switch (nr) {
++	case 0:
++		/* In this case, the addr of memzone is in rax,
++		 * len in rbx. Exit to usersapce directly.
++		 * */
++		vcpu->run->exit_reason = KVM_EXIT_HYPERCALL;
++		vcpu->run->hypercall.nr = (u64)nr;
++		vcpu->run->hypercall.args[0] = (u64)a0;
++		vcpu->run->hypercall.args[1] = (u64)a1;
++		vcpu->run->hypercall.args[2] = (u64)vcpu;
++		printk("hypercall: %llx %llx. vcpu: %p\n",
++		       ((unsigned long long)a0),
++		       ((unsigned long long)a1),
++		       vcpu);
++		ret = 0;
++		r = -1;
++		break;
+ 	case KVM_HC_VAPIC_POLL_IRQ:
+ 		ret = 0;
+ 		break;
+diff --git a/virt/kvm/dprint.c b/virt/kvm/dprint.c
+new file mode 100644
+index 0000000..a2eb451
+--- /dev/null
++++ b/virt/kvm/dprint.c
+@@ -0,0 +1,82 @@
++#include <linux/kernel.h>
++#include <linux/kvm_host.h>
++#include <linux/kvm.h>
++#include <linux/errno.h>
++#include <linux/percpu.h>
++#include <linux/mm.h>
++#include <linux/cpu.h>
++#include <linux/types.h>
++#include <linux/string.h>
++
++#include "dprint.h"
++
++void dp_kvm_userspace_memory_region(struct kvm_userspace_memory_region *mem)
++{
++	printk(KERN_INFO "------userspace memory regions-------\n");
++	printk(KERN_INFO "slot: %u, flags: %u,"
++	      "guest_phys_addr: %llu, memory_size: %llu, userspace_addr: %llu.\n",
++	      (unsigned)mem->slot, (unsigned)mem->flags,
++	      (unsigned long long)mem->guest_phys_addr,
++	      (unsigned long long)mem->memory_size,
++	      (unsigned long long)mem->userspace_addr);
++}
++
++void dp_memory_region(struct kvm *kvm)
++{
++	int i;
++	struct kvm_memslots *slots = kvm->memslots;
++	struct kvm_memory_slot *slot;
++	printk(KERN_INFO "gen: %llu. used_slots: %d\n",
++	       (unsigned long long)slots->generation, slots->used_slots);
++	for (i = 0; i < slots->used_slots + 3; i++) {
++		slot = &slots->memslots[i];
++		printk(KERN_INFO "%d: base_gfn: %llu, npages: %lu,"
++		       "userspace_addr: %lu, id: %d.\n",
++		       i,
++		       (unsigned long long)slot->base_gfn,
++		       slot->npages,
++		       slot->userspace_addr,
++		       (int)slot->id);
++	}
++	/*
++	for (i = KVM_USER_MEM_SLOTS; i < KVM_MEM_SLOTS_NUM; i++) {
++		slot = &slots->memslots[i];
++		printk(KERN_INFO "%d: base_gfn: %llu, npages: %lu,"
++		       "userspace_addr: %lu, id: %d.\n",
++		       i,
++		       (unsigned long long)slot->base_gfn,
++		       slot->npages,
++		       slot->userspace_addr,
++		       (int)slot->id);
++	}
++	*/
++}
++
++struct ept_iterator {
++	u64 addr;
++	u64 shadow_addr;
++	u64 *sptep;
++	int level;
++	unsigned index;
++};
++
++int dp_vcpu_mmu(struct kvm_vcpu *vcpu)
++{
++	struct ept_iterator iterator;
++	unsigned i;
++	printk(KERN_INFO "vcpu mmu\n");
++	spin_lock(&vcpu->kvm->mmu_lock);
++	printk(KERN_INFO "vcpu_id: %d\n", vcpu->vcpu_id);
++	printk(KERN_INFO "vcpu->arch.mmu.root_hpa: %llx\n",
++	       (unsigned long long)vcpu->arch.mmu.root_hpa);
++	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
++		return 0;
++	iterator.shadow_addr = vcpu->arch.mmu.root_hpa;
++	for (i = 0; i < 512; i++) {
++		iterator.sptep = ((u64 *)((unsigned long)(iterator.shadow_addr)+PAGE_OFFSET)) + i;
++		printk(KERN_INFO "%u: %p, %llx\n", i, iterator.sptep, *(iterator.sptep));
++	}
++
++	spin_unlock(&vcpu->kvm->mmu_lock);
++	return 0;
++}
+diff --git a/virt/kvm/dprint.h b/virt/kvm/dprint.h
+new file mode 100644
+index 0000000..0bb36a0
+--- /dev/null
++++ b/virt/kvm/dprint.h
+@@ -0,0 +1,22 @@
++#ifndef __KVM_DPRINT_H
++#define __KVM_DPRINT_H
++
++#define DCONFIG_DP
++#ifdef DCONFIG_DP
++void dp_kvm_userspace_memory_region(struct kvm_userspace_memory_region *mem);
++void dp_memory_region(struct kvm *kvm);
++int dp_vcpu_mmu(struct kvm_vcpu *vcpu);
++#else
++static inline void dp_kvm_userspace_memory_region(struct kvm_userspace_memory_region *mem)
++{
++}
++static inline void dp_memory_region(struct kvm *kvm)
++{
++}
++static inline int dp_vcpu_mmu(struct kvm_vcpu *vcpu)
++{
++	return 0;
++}
++#endif
++
++#endif
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 883530e..9540448 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -60,6 +60,8 @@
+ #include "async_pf.h"
+ #include "vfio.h"
+ 
++#include "dprint.h"
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/kvm.h>
+ 
+@@ -2147,6 +2149,13 @@ static long kvm_vcpu_ioctl(struct file *filp,
+ 		r = kvm_arch_vcpu_ioctl_run(vcpu, vcpu->run);
+ 		trace_kvm_userspace_exit(vcpu->run->exit_reason, r);
+ 		break;
++		/*
++	case KVM_GET_TEST: {
++		// printk(KERN_INFO "We did it!!!hello!!!!!!!!!\n");
++		// dp_vcpu_mmu(vcpu);
++		r = 888;
++		break;
++	}*/
+ 	case KVM_GET_REGS: {
+ 		struct kvm_regs *kvm_regs;
+ 
+@@ -2532,7 +2541,9 @@ static long kvm_vm_ioctl(struct file *filp,
+ 						sizeof kvm_userspace_mem))
+ 			goto out;
+ 
++		// dp_kvm_userspace_memory_region(&kvm_userspace_mem);
+ 		r = kvm_vm_ioctl_set_memory_region(kvm, &kvm_userspace_mem);
++		// dp_memory_region(kvm);
+ 		break;
+ 	}
+ 	case KVM_GET_DIRTY_LOG: {
